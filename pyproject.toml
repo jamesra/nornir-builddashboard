@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = 'setuptools.build_meta'
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nornir_dashboard*"]
+
+[tool.setuptools.package-data]
+nornir_dashboard = ["static/*"]
+
+[project]
+name = "nornir_dashboard"
+version = "0.1.0"
+authors = [
+    { name = "James Anderson", email = "James.R.Anderson@utah.edu" },
+]
+description = "Web dashboard for monitoring nornir-build runs over MQTT"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi >= 0.110",
+    "uvicorn[standard] >= 0.29",
+    "paho-mqtt >= 2.1.0",
+]
+classifiers = [
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.scripts]
+nornir-dashboard = "nornir_dashboard.main:run"
+
+[project.urls]
+Homepage = "https://github.com/jamesra/nornir-builddashboard"

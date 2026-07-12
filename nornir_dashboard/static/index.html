@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nornir Build Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+    <header class="topbar">
+        <h1>Nornir Build Dashboard</h1>
+        <span id="connection" class="conn conn-down">disconnected</span>
+    </header>
+
+    <main class="layout">
+        <aside class="runlist">
+            <div class="runlist-head">
+                <input id="runfilter" type="search" placeholder="Filter runs..." />
+            </div>
+            <ul id="runs"></ul>
+        </aside>
+
+        <section class="detail">
+            <div id="detail-empty" class="detail-empty">
+                Select a run to see live progress.
+            </div>
+
+            <div id="detail" class="detail-body hidden">
+                <div class="detail-head">
+                    <div class="detail-title">
+                        <span id="d-pipeline" class="pipeline">-</span>
+                        <span id="d-status" class="badge">-</span>
+                    </div>
+                    <div class="detail-meta">
+                        <div><label>Run</label><span id="d-runid">-</span></div>
+                        <div><label>Volume</label><span id="d-volume">-</span></div>
+                        <div><label>Host</label><span id="d-host">-</span></div>
+                        <div><label>Errors</label><span id="d-errors" class="count err">0</span></div>
+                        <div><label>Warnings</label><span id="d-warnings" class="count warn">0</span></div>
+                    </div>
+                </div>
+
+                <div class="status-cards">
+                    <div class="card">
+                        <label>Current stage / command</label>
+                        <span id="d-stage">-</span>
+                    </div>
+                    <div class="card">
+                        <label>Current section / element</label>
+                        <span id="d-section">-</span>
+                    </div>
+                </div>
+
+                <div class="progress-wrap">
+                    <div class="progress-bar"><div id="d-progress-fill" class="progress-fill"></div></div>
+                    <span id="d-progress-label" class="progress-label">-</span>
+                </div>
+
+                <div class="log-controls">
+                    <label><input type="checkbox" class="lvl" value="error" checked /> errors</label>
+                    <label><input type="checkbox" class="lvl" value="warning" checked /> warnings</label>
+                    <label><input type="checkbox" class="lvl" value="info" checked /> info</label>
+                    <label><input type="checkbox" class="lvl" value="debug" /> debug</label>
+                    <label><input type="checkbox" class="lvl" value="event" checked /> events</label>
+                    <label><input type="checkbox" class="lvl" value="status" checked /> status</label>
+                    <input id="logsearch" type="search" placeholder="Search log..." />
+                </div>
+
+                <div id="log" class="log"></div>
+            </div>
+        </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
