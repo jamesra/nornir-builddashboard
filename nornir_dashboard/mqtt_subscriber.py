@@ -73,6 +73,16 @@ class MqttSubscriber:
         except Exception:  # pragma: no cover - best effort shutdown
             pass
 
+    def clear_retained(self, run_id: str) -> None:
+        """Clear retained meta for a deleted run by publishing an empty retained payload."""
+        if not run_id:
+            return
+        topic = f"{self._topic_root}/{run_id}/meta"
+        try:
+            self._client.publish(topic, payload=b"", retain=True)
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning("Failed to clear retained meta for %s: %s", run_id, exc)
+
     def _on_connect(self, client: mqtt.Client, userdata: Any, flags: Any,
                     reason_code: Any, properties: Any = None) -> None:
         topic = f"{self._topic_root}/#"
@@ -90,6 +100,10 @@ class MqttSubscriber:
     def _handle_message(self, topic: str, raw_payload: bytes) -> None:
         run_id, leaf = self._parse_topic(topic)
         if run_id is None or leaf is None:
+            return
+
+        # Empty retained clear for deleted runs — ignore.
+        if not raw_payload:
             return
 
         try:
@@ -167,6 +181,7 @@ class MqttSubscriber:
                 "status": payload.get("status"),
                 "start_ts": payload.get("start_ts"),
                 "end_ts": payload.get("end_ts"),
+                "compute": payload.get("compute"),
             })
             return
 
@@ -203,21 +218,91 @@ class MqttSubscriber:
                 fields["current_section"] = str(payload.get("section"))
             elif payload.get("element") is not None:
                 fields["current_element"] = payload.get("element")
-            current = payload.get("current")
-            total = payload.get("total")
-            if current is not None and total:
-                fields["progress_current"] = current
-                fields["progress_total"] = total
-                try:
-                    fields["progress_fraction"] = float(current) / float(total)
-                except (TypeError, ZeroDivisionError, ValueError):
-                    pass
+            self._merge_progress_track(run_id, payload)
+            # Refresh top-level progress from shallowest largest track after merge.
+            self._refresh_top_level_progress(run_id)
 
+        if fields:
+            self._store.update_run_fields(run_id, fields)
+
+    def _merge_progress_track(self, run_id: str, payload: dict[str, Any]) -> None:
+        """Merge an iterate_progress or labeled progress update into progress_tracks."""
+        track_id = payload.get("track_id") or payload.get("label") or "progress"
+        label = payload.get("label") or str(track_id)
+        current = payload.get("current")
+        if current is None:
+            current = payload.get("progress")
+        total = payload.get("total")
+        depth = payload.get("depth")
+        if depth is None:
+            depth = 0
+
+        fraction = payload.get("fraction")
+        if fraction is None and current is not None and total:
+            try:
+                fraction = float(current) / float(total)
+            except (TypeError, ZeroDivisionError, ValueError):
+                fraction = None
+
+        tracks = dict(self._store.get_progress_tracks(run_id))
+        tracks[str(track_id)] = {
+            "label": label,
+            "depth": depth,
+            "current": current,
+            "total": total,
+            "fraction": fraction,
+        }
+        self._store.update_run_fields(run_id, {"progress_tracks": tracks})
+
+    def _refresh_top_level_progress(self, run_id: str) -> None:
+        """Set sidebar progress from the shallowest active track with the largest total."""
+        tracks = self._store.get_progress_tracks(run_id)
+        if not tracks:
+            return
+
+        def sort_key(item: tuple[str, Any]) -> tuple:
+            track = item[1] if isinstance(item[1], dict) else {}
+            depth = track.get("depth", 999)
+            total = track.get("total") or 0
+            try:
+                total_val = float(total)
+            except (TypeError, ValueError):
+                total_val = 0.0
+            return (depth, -total_val)
+
+        ordered = sorted(tracks.items(), key=sort_key)
+        best = ordered[0][1] if ordered else None
+        if not isinstance(best, dict):
+            return
+
+        fields: dict[str, Any] = {}
+        if best.get("current") is not None:
+            fields["progress_current"] = best.get("current")
+        if best.get("total") is not None:
+            fields["progress_total"] = best.get("total")
+        if best.get("fraction") is not None:
+            fields["progress_fraction"] = best.get("fraction")
+        elif best.get("total"):
+            try:
+                fields["progress_fraction"] = float(best.get("current") or 0) / float(best["total"])
+            except (TypeError, ZeroDivisionError, ValueError):
+                pass
         if fields:
             self._store.update_run_fields(run_id, fields)
 
     def _update_progress(self, run_id: str, payload: dict[str, Any]) -> None:
         """Update progress columns from a CurseProgress-style payload."""
+        if payload.get("label"):
+            # Operation-level labeled progress joins the nested track stack.
+            labeled = dict(payload)
+            if "track_id" not in labeled:
+                labeled["track_id"] = f"op:{payload.get('label')}"
+            if "depth" not in labeled:
+                labeled["depth"] = 100  # deeper than iterate tracks by default
+            if "current" not in labeled and payload.get("progress") is not None:
+                labeled["current"] = payload.get("progress")
+            self._merge_progress_track(run_id, labeled)
+
         fields: dict[str, Any] = {}
         if payload.get("progress") is not None:
             fields["progress_current"] = payload.get("progress")

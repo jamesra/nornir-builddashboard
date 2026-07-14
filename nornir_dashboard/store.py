@@ -25,6 +25,12 @@ _RUN_COLUMNS = (
     "status", "start_ts", "end_ts", "first_seen", "last_seen",
     "error_count", "warning_count", "current_stage", "current_element",
     "current_section", "progress_current", "progress_total", "progress_fraction",
+    "compute", "progress_tracks",
+)
+
+_ADDED_COLUMNS = (
+    ("compute", "TEXT"),
+    ("progress_tracks", "TEXT"),
 )
 
 
@@ -70,7 +76,9 @@ class DashboardStore:
                     current_section TEXT,
                     progress_current INTEGER,
                     progress_total INTEGER,
-                    progress_fraction REAL
+                    progress_fraction REAL,
+                    compute TEXT,
+                    progress_tracks TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS events (
@@ -85,6 +93,15 @@ class DashboardStore:
                 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
                 """
             )
+            existing = {
+                row[1]
+                for row in self._connection.execute("PRAGMA table_info(runs)").fetchall()
+            }
+            for column, column_type in _ADDED_COLUMNS:
+                if column not in existing:
+                    self._connection.execute(
+                        f"ALTER TABLE runs ADD COLUMN {column} {column_type}"
+                    )
             self._connection.commit()
 
     # -- run helpers ------------------------------------------------------
@@ -111,6 +128,9 @@ class DashboardStore:
         if not updates:
             return
 
+        if "progress_tracks" in updates and not isinstance(updates["progress_tracks"], str):
+            updates["progress_tracks"] = json.dumps(updates["progress_tracks"], default=str)
+
         assignments = ", ".join(f"{column}=?" for column in updates)
         values = list(updates.values())
         values.append(run_id)
@@ -131,6 +151,20 @@ class DashboardStore:
             )
             self._connection.commit()
 
+    @staticmethod
+    def _decode_run_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        """Convert a runs row into a JSON-friendly dict with parsed progress_tracks."""
+        result = dict(row)
+        raw_tracks = result.get("progress_tracks")
+        if isinstance(raw_tracks, str) and raw_tracks:
+            try:
+                result["progress_tracks"] = json.loads(raw_tracks)
+            except (TypeError, ValueError):
+                result["progress_tracks"] = {}
+        elif raw_tracks is None:
+            result["progress_tracks"] = {}
+        return result
+
     def list_runs(self, limit: int = 200) -> list[dict[str, Any]]:
         """Return run summaries, most recently active first."""
         with self._lock:
@@ -142,7 +176,7 @@ class DashboardStore:
                 """,
                 (limit,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._decode_run_row(row) for row in rows]
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         """Return a single run summary, or None when unknown."""
@@ -150,7 +184,66 @@ class DashboardStore:
             row = self._connection.execute(
                 "SELECT * FROM runs WHERE run_id=?", (run_id,)
             ).fetchone()
-        return dict(row) if row is not None else None
+        return self._decode_run_row(row) if row is not None else None
+
+    def get_progress_tracks(self, run_id: str) -> dict[str, Any]:
+        """Return the progress_tracks map for a run (empty dict when unset)."""
+        run = self.get_run(run_id)
+        if run is None:
+            return {}
+        tracks = run.get("progress_tracks") or {}
+        return tracks if isinstance(tracks, dict) else {}
+
+    def delete_run(self, run_id: str) -> bool:
+        """Delete a run and its events. Return True when a row was removed."""
+        with self._lock:
+            cursor = self._connection.execute(
+                "DELETE FROM runs WHERE run_id=?", (run_id,)
+            )
+            self._connection.execute("DELETE FROM events WHERE run_id=?", (run_id,))
+            self._connection.commit()
+            return cursor.rowcount > 0
+
+    def list_expired_run_ids(self, older_than_days: float, now: float | None = None
+                             ) -> list[str]:
+        """Return run ids whose last_seen is older than the retention window."""
+        if older_than_days <= 0:
+            return []
+        now = time.time() if now is None else now
+        cutoff = now - (older_than_days * 86400.0)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT run_id FROM runs
+                WHERE COALESCE(last_seen, first_seen, 0) < ?
+                """,
+                (cutoff,),
+            ).fetchall()
+        return [str(row["run_id"]) for row in rows]
+
+    def mark_stale_runs(self, stale_after_seconds: float, now: float | None = None
+                        ) -> list[str]:
+        """Mark running runs as stale when they have not sent traffic recently."""
+        if stale_after_seconds <= 0:
+            return []
+        now = time.time() if now is None else now
+        cutoff = now - stale_after_seconds
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT run_id FROM runs
+                WHERE status='running' AND COALESCE(last_seen, first_seen, 0) < ?
+                """,
+                (cutoff,),
+            ).fetchall()
+            run_ids = [str(row["run_id"]) for row in rows]
+            for run_id in run_ids:
+                self._connection.execute(
+                    "UPDATE runs SET status=? WHERE run_id=?",
+                    ("stale", run_id),
+                )
+            self._connection.commit()
+        return run_ids
 
     # -- event helpers ----------------------------------------------------
 

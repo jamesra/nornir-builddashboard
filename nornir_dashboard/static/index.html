@@ -32,8 +32,10 @@
                         <span id="d-status" class="badge">-</span>
                     </div>
                     <div class="detail-meta">
+                        <div><label>Runtime</label><span id="d-runtime">-</span></div>
                         <div><label>Run</label><span id="d-runid">-</span></div>
                         <div><label>Volume</label><span id="d-volume">-</span></div>
+                        <div><label>Compute</label><span id="d-compute">-</span></div>
                         <div><label>Host</label><span id="d-host">-</span></div>
                         <div><label>Errors</label><span id="d-errors" class="count err">0</span></div>
                         <div><label>Warnings</label><span id="d-warnings" class="count warn">0</span></div>
@@ -51,10 +53,7 @@
                     </div>
                 </div>
 
-                <div class="progress-wrap">
-                    <div class="progress-bar"><div id="d-progress-fill" class="progress-fill"></div></div>
-                    <span id="d-progress-label" class="progress-label">-</span>
-                </div>
+                <div id="d-progress-tracks" class="progress-tracks"></div>
 
                 <div class="log-controls">
                     <label><input type="checkbox" class="lvl" value="error" checked /> errors</label>
@@ -66,7 +65,11 @@
                     <input id="logsearch" type="search" placeholder="Search log..." />
                 </div>
 
-                <div id="log" class="log"></div>
+                <div class="log-wrap">
+                    <div id="log" class="log"></div>
+                    <button id="jump-bottom" type="button" class="jump-bottom hidden"
+                            title="Jump to bottom and resume auto-scroll">Jump to bottom</button>
+                </div>
             </div>
         </section>
     </main>

@@ -17,6 +17,10 @@ class DashboardConfig:
     http_host: str
     http_port: int
     max_events_per_run: int
+    stale_after_seconds: float
+    stale_sweep_interval: float
+    retention_days: float
+    retention_sweep_interval: float
 
     def __init__(self) -> None:
         self.mqtt_host = os.environ.get("NORNIR_MQTT_HOST", "127.0.0.1")
@@ -30,6 +34,18 @@ class DashboardConfig:
         self.http_port = int(os.environ.get("NORNIR_DASHBOARD_PORT", "8087"))
         self.max_events_per_run = int(
             os.environ.get("NORNIR_DASHBOARD_MAX_EVENTS", "5000")
+        )
+        self.stale_after_seconds = float(
+            os.environ.get("NORNIR_DASHBOARD_STALE_AFTER", "600")
+        )
+        self.stale_sweep_interval = float(
+            os.environ.get("NORNIR_DASHBOARD_STALE_SWEEP_INTERVAL", "60")
+        )
+        self.retention_days = float(
+            os.environ.get("NORNIR_DASHBOARD_RETENTION_DAYS", "30")
+        )
+        self.retention_sweep_interval = float(
+            os.environ.get("NORNIR_DASHBOARD_RETENTION_SWEEP_INTERVAL", "86400")
         )
 
 

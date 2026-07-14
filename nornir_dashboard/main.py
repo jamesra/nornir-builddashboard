@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import os
 
@@ -71,6 +71,70 @@ class ConnectionManager:
                 self._clients.discard(client)
 
 
+def _delete_run_and_notify(store: DashboardStore, subscriber: MqttSubscriber,
+                           manager: ConnectionManager, run_id: str) -> bool:
+    """Delete a run from the store, clear retained MQTT meta, and notify browsers."""
+    if not store.delete_run(run_id):
+        return False
+    subscriber.clear_retained(run_id)
+    manager.submit_from_thread({"type": "run_deleted", "run_id": run_id})
+    return True
+
+
+def _run_retention_sweep(store: DashboardStore, subscriber: MqttSubscriber,
+                         manager: ConnectionManager, retention_days: float) -> int:
+    """Delete runs older than *retention_days* and notify connected clients."""
+    if retention_days <= 0:
+        return 0
+    expired = store.list_expired_run_ids(retention_days)
+    deleted = 0
+    for run_id in expired:
+        if _delete_run_and_notify(store, subscriber, manager, run_id):
+            deleted += 1
+    return deleted
+
+
+async def _retention_sweeper(store: DashboardStore, subscriber: MqttSubscriber,
+                             manager: ConnectionManager, retention_days: float,
+                             interval: float) -> None:
+    """Background task that periodically deletes expired runs."""
+    while True:
+        try:
+            count = _run_retention_sweep(store, subscriber, manager, retention_days)
+            if count:
+                logger.info("Retention sweep deleted %s run(s)", count)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Retention sweep failed: %s", exc)
+        await asyncio.sleep(interval)
+
+
+async def _stale_sweeper(store: DashboardStore, manager: ConnectionManager,
+                         stale_after: float, interval: float) -> None:
+    """Background task that marks quiet running builds as stale."""
+    while True:
+        try:
+            if stale_after > 0:
+                stale_ids = store.mark_stale_runs(stale_after)
+                for run_id in stale_ids:
+                    run = store.get_run(run_id)
+                    if run is not None:
+                        manager.submit_from_thread({
+                            "type": "event",
+                            "event": {
+                                "id": 0,
+                                "run_id": run_id,
+                                "ts": run.get("last_seen") or 0,
+                                "kind": "meta",
+                                "level": None,
+                                "payload": {"status": "stale"},
+                            },
+                            "run": run,
+                        })
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Stale sweep failed: %s", exc)
+        await asyncio.sleep(interval)
+
+
 def create_app(config: DashboardConfig | None = None) -> FastAPI:
     """Build and configure the dashboard FastAPI application."""
     config = config or load_config()
@@ -89,17 +153,41 @@ def create_app(config: DashboardConfig | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         manager.bind_loop(asyncio.get_running_loop())
         broadcaster_task = asyncio.create_task(manager.broadcaster())
+        retention_task = None
+        stale_task = None
+        if config.retention_days > 0:
+            retention_task = asyncio.create_task(
+                _retention_sweeper(
+                    store, subscriber, manager,
+                    retention_days=config.retention_days,
+                    interval=config.retention_sweep_interval,
+                )
+            )
+        if config.stale_after_seconds > 0:
+            stale_task = asyncio.create_task(
+                _stale_sweeper(
+                    store, manager,
+                    stale_after=config.stale_after_seconds,
+                    interval=config.stale_sweep_interval,
+                )
+            )
         subscriber.start()
         try:
             yield
         finally:
             subscriber.stop()
             broadcaster_task.cancel()
+            if retention_task is not None:
+                retention_task.cancel()
+            if stale_task is not None:
+                stale_task.cancel()
             store.close()
 
     app = FastAPI(title="Nornir Build Dashboard", lifespan=lifespan)
     app.state.store = store
     app.state.config = config
+    app.state.subscriber = subscriber
+    app.state.manager = manager
 
     @app.get("/api/runs")
     def list_runs(limit: int = 200) -> dict[str, Any]:
@@ -110,6 +198,14 @@ def create_app(config: DashboardConfig | None = None) -> FastAPI:
     def get_run(run_id: str) -> dict[str, Any]:
         """Return a single run summary."""
         return {"run": store.get_run(run_id)}
+
+    @app.delete("/api/runs/{run_id}")
+    def delete_run(run_id: str) -> JSONResponse:
+        """Delete a run and notify live clients."""
+        deleted = _delete_run_and_notify(store, subscriber, manager, run_id)
+        if not deleted:
+            return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+        return JSONResponse({"ok": True, "run_id": run_id})
 
     @app.get("/api/runs/{run_id}/events")
     def get_events(run_id: str, after_id: int = 0, limit: int = 2000) -> dict[str, Any]:
