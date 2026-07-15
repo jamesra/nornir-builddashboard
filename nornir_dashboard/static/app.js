@@ -76,6 +76,31 @@ function formatCompute(compute) {
 
 // -- run list ---------------------------------------------------------------
 
+function isActiveRun(run) {
+  return !["completed", "failed", "skipped", "stale"].includes(run.status || "running");
+}
+
+function runStartTs(run) {
+  return run.start_ts || run.first_seen || 0;
+}
+
+function runLastSeenTs(run) {
+  return run.last_seen || run.first_seen || 0;
+}
+
+function compareRuns(a, b) {
+  const aActive = isActiveRun(a) ? 0 : 1;
+  const bActive = isActiveRun(b) ? 0 : 1;
+  if (aActive !== bActive) return aActive - bActive;
+
+  if (aActive === 0) {
+    const activity = runLastSeenTs(b) - runLastSeenTs(a);
+    if (activity !== 0) return activity;
+  }
+
+  return runStartTs(b) - runStartTs(a);
+}
+
 function upsertRun(run) {
   if (!run || !run.run_id) return;
   state.runs.set(run.run_id, run);
@@ -84,9 +109,7 @@ function upsertRun(run) {
 function renderRunList() {
   const ul = el("runs");
   const filter = state.runFilter.toLowerCase();
-  const runs = Array.from(state.runs.values()).sort(
-    (a, b) => (b.last_seen || 0) - (a.last_seen || 0)
-  );
+  const runs = Array.from(state.runs.values()).sort(compareRuns);
 
   ul.innerHTML = "";
   for (const run of runs) {
@@ -110,7 +133,16 @@ function renderRunList() {
     li.innerHTML = `
       <div class="r-line1">
         <span class="r-pipeline">${escapeHtml(run.pipeline || "(pipeline)")}</span>
-        <span class="badge ${statusClass(status)}">${escapeHtml(status)}</span>
+        <div class="r-line1-actions">
+          <span class="badge ${statusClass(status)}">${escapeHtml(status)}</span>
+          <button type="button" class="run-delete" title="Delete run"
+                  aria-label="Delete run">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path fill="currentColor"
+                    d="M6 2h4l.5 1H14v1H2V3h3.5L6 2zm1 4v6H6V6h1zm3 0v6H9V6h1zM3.5 5h9l-.7 9.1A1 1 0 0 1 10.8 15H5.2a1 1 0 0 1-1-.9L3.5 5z"/>
+            </svg>
+          </button>
+        </div>
       </div>
       <div class="r-volume" title="${escapeHtml(run.volumepath || "")}">${escapeHtml(run.volumepath || "")}</div>
       <div class="r-meta">STARTED ${escapeHtml(fmtDateTime(started) || "-")} · ${escapeHtml(runtime)}</div>
@@ -120,7 +152,54 @@ function renderRunList() {
       </div>
       <div class="r-progress"><div class="r-progress-fill" style="width:${pct.toFixed(1)}%"></div></div>
       <div class="r-progress-label">${escapeHtml(progressLabel)}</div>`;
+
+    const deleteBtn = li.querySelector(".run-delete");
+    deleteBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void deleteRun(run);
+    });
+
     ul.appendChild(li);
+  }
+}
+
+function removeRunFromUi(runId) {
+  state.runs.delete(runId);
+  if (state.selectedRunId === runId) {
+    state.selectedRunId = null;
+    el("detail").classList.add("hidden");
+    el("detail-empty").classList.remove("hidden");
+    el("log").innerHTML = "";
+  }
+  renderRunList();
+}
+
+async function deleteRun(run) {
+  if (!run || !run.run_id) return;
+
+  if (isActiveRun(run)) {
+    const label = run.pipeline || run.run_id;
+    const confirmed = window.confirm(
+      `Delete running build "${label}"?\n\nThis removes it from the dashboard only; the build process itself is not stopped.`);
+    if (!confirmed) return;
+  }
+
+  const runId = run.run_id;
+  try {
+    const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}`, { method: "DELETE" });
+    if (resp.status === 404) {
+      removeRunFromUi(runId);
+      return;
+    }
+    if (!resp.ok) {
+      const body = await resp.text();
+      window.alert(`Failed to delete run: ${resp.status} ${body}`);
+      return;
+    }
+    // WebSocket run_deleted also updates clients; apply locally for immediate feedback.
+    removeRunFromUi(runId);
+  } catch (err) {
+    window.alert(`Failed to delete run: ${err}`);
   }
 }
 
@@ -322,14 +401,7 @@ function connectWs() {
     try { data = JSON.parse(msg.data); } catch (_) { return; }
 
     if (data.type === "run_deleted") {
-      state.runs.delete(data.run_id);
-      if (state.selectedRunId === data.run_id) {
-        state.selectedRunId = null;
-        el("detail").classList.add("hidden");
-        el("detail-empty").classList.remove("hidden");
-        el("log").innerHTML = "";
-      }
-      renderRunList();
+      removeRunFromUi(data.run_id);
       return;
     }
 

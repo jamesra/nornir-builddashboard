@@ -166,12 +166,22 @@ class DashboardStore:
         return result
 
     def list_runs(self, limit: int = 200) -> list[dict[str, Any]]:
-        """Return run summaries, most recently active first."""
+        """Return run summaries: active by last activity then start, then inactive by start."""
         with self._lock:
             rows = self._connection.execute(
                 """
                 SELECT * FROM runs
-                ORDER BY COALESCE(last_seen, first_seen, 0) DESC
+                ORDER BY
+                  CASE
+                    WHEN COALESCE(status, 'running') IN ('completed', 'failed', 'skipped', 'stale')
+                    THEN 1 ELSE 0
+                  END ASC,
+                  CASE
+                    WHEN COALESCE(status, 'running') IN ('completed', 'failed', 'skipped', 'stale')
+                    THEN 0
+                    ELSE COALESCE(last_seen, first_seen, 0)
+                  END DESC,
+                  COALESCE(start_ts, first_seen, 0) DESC
                 LIMIT ?
                 """,
                 (limit,),

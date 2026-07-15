@@ -34,6 +34,7 @@ class MqttSubscriber:
     _client: mqtt.Client
     _started: bool
     _lock: threading.Lock
+    _connect_thread: threading.Thread | None
 
     def __init__(self, store: DashboardStore, host: str, port: int, keepalive: int,
                  topic_root: str, broadcast: BroadcastFn) -> None:
@@ -45,28 +46,55 @@ class MqttSubscriber:
         self._broadcast = broadcast
         self._started = False
         self._lock = threading.Lock()
+        self._connect_thread = None
 
         self._client = mqtt.Client(callback_api_version=mqtt_enum.CallbackAPIVersion.VERSION2)
+        self._client.reconnect_delay_set(min_delay=1, max_delay=60)
         self._client.on_connect = self._on_connect
+        self._client.on_disconnect = self._on_disconnect
         self._client.on_message = self._on_message
 
     def start(self) -> None:
-        """Connect to the broker and begin processing messages in a background thread."""
+        """Connect to the broker and begin processing messages in a background thread.
+
+        Retries with exponential backoff when the broker is not yet reachable
+        (for example a Compose ``depends_on`` race with Mosquitto).
+        """
         with self._lock:
             if self._started:
                 return
             self._started = True
 
-        try:
-            self._client.connect(self._host, self._port, self._keepalive)
-            self._client.loop_start()
-            logger.info("Dashboard subscriber connecting to %s:%s", self._host, self._port)
-        except Exception as exc:  # pragma: no cover - network dependent
-            logger.error("Failed to connect to MQTT broker %s:%s: %s",
-                         self._host, self._port, exc)
+        self._connect_thread = threading.Thread(
+            target=self._connect_with_retry,
+            name="dashboard-mqtt-connect",
+            daemon=True,
+        )
+        self._connect_thread.start()
+
+    def _connect_with_retry(self) -> None:
+        """Attempt MQTT connect until success or :meth:`stop` clears ``_started``."""
+        delay = 1.0
+        max_delay = 60.0
+        while self._started:
+            try:
+                self._client.connect(self._host, self._port, self._keepalive)
+                self._client.loop_start()
+                logger.info(
+                    "Dashboard subscriber connecting to %s:%s (topic root %s)",
+                    self._host, self._port, self._topic_root)
+                return
+            except Exception as exc:  # pragma: no cover - network dependent
+                logger.error(
+                    "Failed to connect to MQTT broker %s:%s: %s; retrying in %.0fs",
+                    self._host, self._port, exc, delay)
+                time.sleep(delay)
+                delay = min(delay * 2.0, max_delay)
 
     def stop(self) -> None:
         """Stop the network loop and disconnect from the broker."""
+        with self._lock:
+            self._started = False
         try:
             self._client.loop_stop()
             self._client.disconnect()
@@ -87,7 +115,15 @@ class MqttSubscriber:
                     reason_code: Any, properties: Any = None) -> None:
         topic = f"{self._topic_root}/#"
         client.subscribe(topic)
-        logger.info("Subscribed to %s", topic)
+        logger.info(
+            "Subscribed to %s on %s:%s (reason=%s)",
+            topic, self._host, self._port, reason_code)
+
+    def _on_disconnect(self, client: mqtt.Client, userdata: Any, flags: Any,
+                       reason_code: Any, properties: Any = None) -> None:
+        logger.warning(
+            "Disconnected from MQTT broker %s:%s (%s); paho will auto-reconnect",
+            self._host, self._port, reason_code)
 
     def _on_message(self, client: mqtt.Client, userdata: Any, message: Any) -> None:
         try:

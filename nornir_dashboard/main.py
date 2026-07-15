@@ -191,7 +191,7 @@ def create_app(config: DashboardConfig | None = None) -> FastAPI:
 
     @app.get("/api/runs")
     def list_runs(limit: int = 200) -> dict[str, Any]:
-        """Return summaries for the most recently active runs."""
+        """Return summaries: active runs first (by activity, then start), then inactive by start."""
         return {"runs": store.list_runs(limit=limit)}
 
     @app.get("/api/runs/{run_id}")
