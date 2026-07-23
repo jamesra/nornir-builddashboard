@@ -35,6 +35,7 @@ class MqttSubscriber:
     _started: bool
     _lock: threading.Lock
     _connect_thread: threading.Thread | None
+    _stop_event: threading.Event
 
     def __init__(self, store: DashboardStore, host: str, port: int, keepalive: int,
                  topic_root: str, broadcast: BroadcastFn) -> None:
@@ -47,6 +48,7 @@ class MqttSubscriber:
         self._started = False
         self._lock = threading.Lock()
         self._connect_thread = None
+        self._stop_event = threading.Event()
 
         self._client = mqtt.Client(callback_api_version=mqtt_enum.CallbackAPIVersion.VERSION2)
         self._client.reconnect_delay_set(min_delay=1, max_delay=60)
@@ -88,13 +90,17 @@ class MqttSubscriber:
                 logger.error(
                     "Failed to connect to MQTT broker %s:%s: %s; retrying in %.0fs",
                     self._host, self._port, exc, delay)
-                time.sleep(delay)
+                if self._stop_event.wait(timeout=delay):
+                    return
+                if not self._started:
+                    return
                 delay = min(delay * 2.0, max_delay)
 
     def stop(self) -> None:
         """Stop the network loop and disconnect from the broker."""
         with self._lock:
             self._started = False
+        self._stop_event.set()
         try:
             self._client.loop_stop()
             self._client.disconnect()
@@ -356,3 +362,5 @@ class MqttSubscriber:
 
         if fields:
             self._store.update_run_fields(run_id, fields)
+        if payload.get("label"):
+            self._refresh_top_level_progress(run_id)

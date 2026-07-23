@@ -67,4 +67,10 @@ NORNIR_MQTT_HOST=127.0.0.1 nornir-dashboard
 ## Running with Docker
 
 See `nornir-docker/compose.dashboard.yaml` for a ready-to-run stack that starts
-a mosquitto broker and the dashboard together.
+a mosquitto broker and the dashboard together. From the monorepo root:
+
+```powershell
+.\nornir-docker\start-dashboard.ps1
+# after changing nornir-builddashboard code:
+.\nornir-docker\start-dashboard.ps1 -Rebuild
+```

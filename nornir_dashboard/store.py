@@ -124,7 +124,10 @@ class DashboardStore:
 
     def update_run_fields(self, run_id: str, fields: dict[str, Any]) -> None:
         """Update the given summary columns for a run, ignoring unknown keys."""
-        updates = {k: v for k, v in fields.items() if k in _RUN_COLUMNS and k != "run_id"}
+        updates = {
+            k: v for k, v in fields.items()
+            if k in _RUN_COLUMNS and k != "run_id" and v is not None
+        }
         if not updates:
             return
 

@@ -1,5 +1,7 @@
 "use strict";
 
+const LOG_DOM_MAX = 500;
+
 const state = {
   runs: new Map(),       // run_id -> summary
   selectedRunId: null,
@@ -66,6 +68,53 @@ function computeProgressFraction(run) {
   return fraction;
 }
 
+function progressFractionToPercent(fraction) {
+  if (fraction === null || fraction === undefined) return 0;
+  return Math.max(0, Math.min(1, fraction)) * 100;
+}
+
+function progressTracksList(run) {
+  if (!run.progress_tracks || typeof run.progress_tracks !== "object") return [];
+  return Object.values(run.progress_tracks);
+}
+
+function isSingleItemTrack(track) {
+  return track && track.total === 1;
+}
+
+function formatTrackStatusLabel(track, fraction) {
+  if (isSingleItemTrack(track)) {
+    return track.label || "1 item";
+  }
+  const pct = progressFractionToPercent(fraction);
+  if (track.total != null) {
+    return `${track.current || 0}/${track.total} (${pct.toFixed(0)}%)`;
+  }
+  if (fraction !== null && fraction !== undefined) {
+    return `${pct.toFixed(0)}%`;
+  }
+  return "-";
+}
+
+function sidebarProgressDisplay(run) {
+  const tracks = progressTracksList(run);
+  const singleTrack = tracks.length === 1 && isSingleItemTrack(tracks[0]) ? tracks[0] : null;
+  if (singleTrack) {
+    return { showBar: false, label: singleTrack.label || "1 item" };
+  }
+  const fraction = computeProgressFraction(run);
+  const pct = progressFractionToPercent(fraction);
+  let label = "";
+  if (run.progress_total === 1) {
+    label = run.current_element || run.current_section || "1 item";
+    return { showBar: false, label };
+  }
+  if (run.progress_total) {
+    label = `${run.progress_current || 0}/${run.progress_total}`;
+  }
+  return { showBar: true, pct, label };
+}
+
 function formatCompute(compute) {
   if (!compute) return "-";
   const lower = String(compute).toLowerCase();
@@ -106,6 +155,17 @@ function upsertRun(run) {
   state.runs.set(run.run_id, run);
 }
 
+let _rlPending = false;
+
+function requestRenderRunList() {
+  if (_rlPending) return;
+  _rlPending = true;
+  requestAnimationFrame(() => {
+    _rlPending = false;
+    renderRunList();
+  });
+}
+
 function renderRunList() {
   const ul = el("runs");
   const filter = state.runFilter.toLowerCase();
@@ -118,17 +178,18 @@ function renderRunList() {
 
     const li = document.createElement("li");
     li.className = "run-item" + (run.run_id === state.selectedRunId ? " selected" : "");
+    li.dataset.runId = run.run_id;
     li.onclick = () => selectRun(run.run_id);
 
     const status = run.status || "running";
     const started = run.start_ts || run.first_seen;
     const runtime = fmtDuration(runRuntimeSeconds(run));
-    const fraction = computeProgressFraction(run);
-    const pct = fraction ? Math.max(0, Math.min(1, fraction)) * 100 : 0;
-    let progressLabel = "";
-    if (run.progress_total) {
-      progressLabel = `${run.progress_current || 0}/${run.progress_total}`;
-    }
+    const sidebarProgress = sidebarProgressDisplay(run);
+    const pct = sidebarProgress.pct || 0;
+    const progressLabel = sidebarProgress.label || "";
+    const progressBarHtml = sidebarProgress.showBar
+      ? `<div class="r-progress"><div class="r-progress-fill" style="width:${pct.toFixed(1)}%"></div></div>`
+      : "";
 
     li.innerHTML = `
       <div class="r-line1">
@@ -150,7 +211,7 @@ function renderRunList() {
         <span class="err">${run.error_count || 0} err</span>
         &middot; <span class="warn">${run.warning_count || 0} warn</span>
       </div>
-      <div class="r-progress"><div class="r-progress-fill" style="width:${pct.toFixed(1)}%"></div></div>
+      ${progressBarHtml}
       <div class="r-progress-label">${escapeHtml(progressLabel)}</div>`;
 
     const deleteBtn = li.querySelector(".run-delete");
@@ -163,6 +224,25 @@ function renderRunList() {
   }
 }
 
+function tickRuntimes() {
+  if (state.selectedRunId) {
+    const run = state.runs.get(state.selectedRunId);
+    if (run) {
+      el("d-runtime").textContent = fmtDuration(runRuntimeSeconds(run));
+    }
+  }
+  for (const li of el("runs").querySelectorAll(".run-item[data-run-id]")) {
+    const run = state.runs.get(li.dataset.runId);
+    if (run && isActiveRun(run)) {
+      const meta = li.querySelector(".r-meta");
+      if (meta) {
+        const started = run.start_ts || run.first_seen;
+        meta.textContent = `STARTED ${fmtDateTime(started) || "-"} · ${fmtDuration(runRuntimeSeconds(run))}`;
+      }
+    }
+  }
+}
+
 function removeRunFromUi(runId) {
   state.runs.delete(runId);
   if (state.selectedRunId === runId) {
@@ -171,7 +251,7 @@ function removeRunFromUi(runId) {
     el("detail-empty").classList.remove("hidden");
     el("log").innerHTML = "";
   }
-  renderRunList();
+  requestRenderRunList();
 }
 
 async function deleteRun(run) {
@@ -205,31 +285,45 @@ async function deleteRun(run) {
 
 // -- detail -----------------------------------------------------------------
 
+function isTerminalStatus(status) {
+  return ["completed", "failed", "skipped", "stale"].includes(status || "");
+}
+
 function renderProgressTracks(run) {
   const container = el("d-progress-tracks");
   container.innerHTML = "";
 
-  const tracks = run.progress_tracks && typeof run.progress_tracks === "object"
-    ? Object.values(run.progress_tracks)
-    : [];
+  if (isTerminalStatus(run.status)) {
+    return;
+  }
+
+  const tracks = progressTracksList(run);
 
   if (!tracks.length) {
     // Fallback single bar from top-level progress fields.
     const fraction = computeProgressFraction(run);
-    const pct = fraction ? Math.max(0, Math.min(1, fraction)) * 100 : 0;
-    let label = "-";
-    if (run.progress_total) {
-      label = `${run.progress_current || 0}/${run.progress_total} (${pct.toFixed(0)}%)`;
-    } else if (fraction) {
-      label = `${pct.toFixed(0)}%`;
+    const pct = progressFractionToPercent(fraction);
+    const fallbackTrack = {
+      label: "Progress",
+      total: run.progress_total,
+      current: run.progress_current,
+      fraction,
+    };
+    if (run.progress_total === 1) {
+      fallbackTrack.label = run.current_element || run.current_section || "1 item";
     }
+    const label = formatTrackStatusLabel(fallbackTrack, fraction);
     const track = document.createElement("div");
     track.className = "progress-track";
-    track.innerHTML =
-      `<div class="progress-track-label">Progress</div>` +
-      `<div class="progress-wrap">` +
-      `<div class="progress-bar"><div class="progress-fill" style="width:${pct.toFixed(1)}%"></div></div>` +
-      `<span class="progress-label">${escapeHtml(label)}</span></div>`;
+    if (isSingleItemTrack(fallbackTrack)) {
+      track.innerHTML = `<div class="progress-track-label progress-track-single">${escapeHtml(label)}</div>`;
+    } else {
+      track.innerHTML =
+        `<div class="progress-track-label">Progress</div>` +
+        `<div class="progress-wrap">` +
+        `<div class="progress-bar"><div class="progress-fill" style="width:${pct.toFixed(1)}%"></div></div>` +
+        `<span class="progress-label">${escapeHtml(label)}</span></div>`;
+    }
     container.appendChild(track);
     return;
   }
@@ -240,23 +334,22 @@ function renderProgressTracks(run) {
     if ((fraction === null || fraction === undefined) && track.total) {
       fraction = (track.current || 0) / track.total;
     }
-    const pct = fraction ? Math.max(0, Math.min(1, fraction)) * 100 : 0;
+    const pct = progressFractionToPercent(fraction);
     const totalHint = track.total != null ? ` (${track.total} total)` : "";
     const title = `${track.label || "progress"}${totalHint}`;
-    let label = "-";
-    if (track.total != null) {
-      label = `${track.current || 0}/${track.total} (${pct.toFixed(0)}%)`;
-    } else if (fraction) {
-      label = `${pct.toFixed(0)}%`;
-    }
+    const label = formatTrackStatusLabel(track, fraction);
 
     const row = document.createElement("div");
     row.className = "progress-track";
-    row.innerHTML =
-      `<div class="progress-track-label">${escapeHtml(title)}</div>` +
-      `<div class="progress-wrap">` +
-      `<div class="progress-bar"><div class="progress-fill" style="width:${pct.toFixed(1)}%"></div></div>` +
-      `<span class="progress-label">${escapeHtml(label)}</span></div>`;
+    if (isSingleItemTrack(track)) {
+      row.innerHTML = `<div class="progress-track-label progress-track-single">${escapeHtml(label)}</div>`;
+    } else {
+      row.innerHTML =
+        `<div class="progress-track-label">${escapeHtml(title)}</div>` +
+        `<div class="progress-wrap">` +
+        `<div class="progress-bar"><div class="progress-fill" style="width:${pct.toFixed(1)}%"></div></div>` +
+        `<span class="progress-label">${escapeHtml(label)}</span></div>`;
+    }
     container.appendChild(row);
   }
 }
@@ -275,8 +368,13 @@ function renderHeader(run) {
   el("d-runtime").textContent = fmtDuration(runRuntimeSeconds(run));
   el("d-errors").textContent = run.error_count || 0;
   el("d-warnings").textContent = run.warning_count || 0;
-  el("d-stage").textContent = run.current_stage || "-";
-  el("d-section").textContent = run.current_section || run.current_element || "-";
+  if (isTerminalStatus(status)) {
+    el("d-stage").textContent = "-";
+    el("d-section").textContent = "-";
+  } else {
+    el("d-stage").textContent = run.current_stage || "-";
+    el("d-section").textContent = run.current_section || run.current_element || "-";
+  }
   renderProgressTracks(run);
 }
 
@@ -306,15 +404,25 @@ function formatEvent(event) {
   return (p.message || "").toString();
 }
 
-function updateJumpBottomVisibility() {
-  const btn = el("jump-bottom");
-  if (!btn) return;
-  if (state.logTailPinned) btn.classList.add("hidden");
-  else btn.classList.remove("hidden");
+function updateJumpButtonVisibility() {
+  const newest = el("jump-newest");
+  const oldest = el("jump-oldest");
+  if (!newest || !oldest) return;
+  if (state.logTailPinned) {
+    newest.classList.add("hidden");
+  } else {
+    newest.classList.remove("hidden");
+  }
+  const log = el("log");
+  if (log && log.children.length > 0) {
+    oldest.classList.remove("hidden");
+  } else {
+    oldest.classList.add("hidden");
+  }
 }
 
-function isLogNearBottom(log) {
-  return log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+function isLogNearTop(log) {
+  return log.scrollTop < 40;
 }
 
 function appendLogLine(event) {
@@ -336,8 +444,11 @@ function appendLogLine(event) {
 
   const log = el("log");
   log.appendChild(line);
+  while (log.children.length > LOG_DOM_MAX) {
+    log.removeChild(log.lastChild);
+  }
   if (state.logTailPinned) {
-    log.scrollTop = log.scrollHeight;
+    log.scrollTop = 0;
   }
 }
 
@@ -352,11 +463,17 @@ function refilterLog() {
   document.querySelectorAll("#log .log-line").forEach(applyLineVisibility);
 }
 
+function renderEvents(events) {
+  for (const event of events) {
+    state.lastEventId = Math.max(state.lastEventId, event.id);
+    appendLogLine(event);
+  }
+}
+
 async function selectRun(runId) {
   state.selectedRunId = runId;
   state.lastEventId = 0;
   state.logTailPinned = true;
-  updateJumpBottomVisibility();
   el("detail-empty").classList.add("hidden");
   el("detail").classList.remove("hidden");
   el("log").innerHTML = "";
@@ -371,15 +488,43 @@ async function selectRun(runId) {
 
   const evResp = await fetch(`/api/runs/${encodeURIComponent(runId)}/events?limit=5000`);
   const evData = await evResp.json();
-  for (const event of evData.events) {
-    state.lastEventId = Math.max(state.lastEventId, event.id);
-    appendLogLine(event);
-  }
+  renderEvents(evData.events || []);
+
   const log = el("log");
-  log.scrollTop = log.scrollHeight;
+  log.scrollTop = 0;
+  updateJumpButtonVisibility();
 }
 
 // -- websocket --------------------------------------------------------------
+
+async function fetchMissedEventsForSelectedRun() {
+  const runId = state.selectedRunId;
+  if (!runId) return;
+
+  const resp = await fetch(
+    `/api/runs/${encodeURIComponent(runId)}/events?after_id=${state.lastEventId}&limit=5000`
+  );
+  const data = await resp.json();
+  renderEvents((data.events || []).filter(e => e.id > state.lastEventId));
+
+  const runResp = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
+  const runData = await runResp.json();
+  if (runData.run) {
+    upsertRun(runData.run);
+    renderHeader(runData.run);
+  }
+  if (state.logTailPinned) {
+    const log = el("log");
+    log.scrollTop = 0;
+  }
+}
+
+async function refreshRunList() {
+  const resp = await fetch("/api/runs");
+  const data = await resp.json();
+  for (const run of data.runs) upsertRun(run);
+  requestRenderRunList();
+}
 
 function connectWs() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -389,6 +534,11 @@ function connectWs() {
     const c = el("connection");
     c.textContent = "live";
     c.className = "conn conn-up";
+    // After dashboard rebuild/restart the socket reconnects before the user
+    // refreshes; re-load run summaries so retained MQTT + SQLite state appear.
+    refreshRunList()
+      .then(() => fetchMissedEventsForSelectedRun())
+      .catch(() => {});
   };
   ws.onclose = () => {
     const c = el("connection");
@@ -408,7 +558,7 @@ function connectWs() {
     if (data.type !== "event") return;
 
     if (data.run) upsertRun(data.run);
-    renderRunList();
+    requestRenderRunList();
 
     const event = data.event;
     if (event && event.run_id === state.selectedRunId) {
@@ -434,7 +584,7 @@ function escapeHtml(value) {
 async function init() {
   el("runfilter").addEventListener("input", (e) => {
     state.runFilter = e.target.value;
-    renderRunList();
+    requestRenderRunList();
   });
   el("logsearch").addEventListener("input", (e) => {
     state.logSearch = e.target.value.toLowerCase();
@@ -450,38 +600,27 @@ async function init() {
 
   const log = el("log");
   log.addEventListener("scroll", () => {
-    if (isLogNearBottom(log)) {
-      // Don't auto-re-pin on incidental near-bottom; only the button re-enables.
-      return;
-    }
-    if (state.logTailPinned) {
+    if (state.logTailPinned && !isLogNearTop(log)) {
       state.logTailPinned = false;
-      updateJumpBottomVisibility();
+      updateJumpButtonVisibility();
     }
   });
 
-  el("jump-bottom").addEventListener("click", () => {
+  el("jump-newest").addEventListener("click", () => {
     state.logTailPinned = true;
-    log.scrollTop = log.scrollHeight;
-    updateJumpBottomVisibility();
+    log.scrollTop = 0;
+    updateJumpButtonVisibility();
   });
 
-  const resp = await fetch("/api/runs");
-  const data = await resp.json();
-  for (const run of data.runs) upsertRun(run);
-  renderRunList();
+  el("jump-oldest").addEventListener("click", () => {
+    log.scrollTop = log.scrollHeight;
+  });
+
+  await refreshRunList();
 
   connectWs();
-  // Keep runtime labels fresh for live runs.
-  setInterval(() => {
-    if (state.selectedRunId) {
-      const run = state.runs.get(state.selectedRunId);
-      if (run) {
-        el("d-runtime").textContent = fmtDuration(runRuntimeSeconds(run));
-      }
-    }
-    renderRunList();
-  }, 1000);
+  // Keep runtime labels fresh for live runs without rebuilding the run list.
+  setInterval(tickRuntimes, 1000);
 }
 
 init();
