@@ -143,7 +143,6 @@ body {
 .log {
     flex: 1; overflow-y: auto; background: #0b0f14; border: 1px solid var(--border);
     border-radius: 8px; padding: 8px; font-family: ui-monospace, monospace; font-size: 12px; min-height: 0;
-    display: flex; flex-direction: column-reverse;
 }
 .jump-btn {
     position: absolute; z-index: 2;

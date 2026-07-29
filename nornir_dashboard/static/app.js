@@ -10,6 +10,7 @@ const state = {
   logSearch: "",
   levels: new Set(["error", "warning", "info", "event", "status"]),
   logTailPinned: true,
+  logNewestFirst: true,
 };
 
 const el = (id) => document.getElementById(id);
@@ -408,13 +409,13 @@ function updateJumpButtonVisibility() {
   const newest = el("jump-newest");
   const oldest = el("jump-oldest");
   if (!newest || !oldest) return;
-  if (state.logTailPinned) {
+  if (state.logTailPinned && state.logNewestFirst) {
     newest.classList.add("hidden");
   } else {
     newest.classList.remove("hidden");
   }
   const log = el("log");
-  if (log && log.children.length > 0) {
+  if (log && log.children.length > 0 && state.logNewestFirst) {
     oldest.classList.remove("hidden");
   } else {
     oldest.classList.add("hidden");
@@ -423,6 +424,21 @@ function updateJumpButtonVisibility() {
 
 function isLogNearTop(log) {
   return log.scrollTop < 40;
+}
+
+function isLogNearBottom(log) {
+  return log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+}
+
+function reverseLogOrder() {
+  const log = el("log");
+  const children = Array.from(log.children);
+  if (children.length < 2) return;
+  const frag = document.createDocumentFragment();
+  for (let i = children.length - 1; i >= 0; i--) {
+    frag.appendChild(children[i]);
+  }
+  log.appendChild(frag);
 }
 
 function appendLogLine(event) {
@@ -443,12 +459,22 @@ function appendLogLine(event) {
   applyLineVisibility(line);
 
   const log = el("log");
-  log.appendChild(line);
-  while (log.children.length > LOG_DOM_MAX) {
-    log.removeChild(log.lastChild);
-  }
-  if (state.logTailPinned) {
-    log.scrollTop = 0;
+  if (state.logNewestFirst) {
+    log.insertBefore(line, log.firstChild);
+    while (log.children.length > LOG_DOM_MAX) {
+      log.removeChild(log.lastChild);
+    }
+    if (state.logTailPinned) {
+      log.scrollTop = 0;
+    }
+  } else {
+    log.appendChild(line);
+    while (log.children.length > LOG_DOM_MAX) {
+      log.removeChild(log.firstChild);
+    }
+    if (state.logTailPinned) {
+      log.scrollTop = log.scrollHeight;
+    }
   }
 }
 
@@ -474,6 +500,7 @@ async function selectRun(runId) {
   state.selectedRunId = runId;
   state.lastEventId = 0;
   state.logTailPinned = true;
+  state.logNewestFirst = true;
   el("detail-empty").classList.add("hidden");
   el("detail").classList.remove("hidden");
   el("log").innerHTML = "";
@@ -515,7 +542,7 @@ async function fetchMissedEventsForSelectedRun() {
   }
   if (state.logTailPinned) {
     const log = el("log");
-    log.scrollTop = 0;
+    log.scrollTop = state.logNewestFirst ? 0 : log.scrollHeight;
   }
 }
 
@@ -600,20 +627,34 @@ async function init() {
 
   const log = el("log");
   log.addEventListener("scroll", () => {
-    if (state.logTailPinned && !isLogNearTop(log)) {
+    if (!state.logTailPinned) return;
+    const unpinned = state.logNewestFirst
+      ? !isLogNearTop(log)
+      : !isLogNearBottom(log);
+    if (unpinned) {
       state.logTailPinned = false;
       updateJumpButtonVisibility();
     }
   });
 
   el("jump-newest").addEventListener("click", () => {
+    if (!state.logNewestFirst) {
+      reverseLogOrder();
+      state.logNewestFirst = true;
+    }
     state.logTailPinned = true;
     log.scrollTop = 0;
     updateJumpButtonVisibility();
   });
 
   el("jump-oldest").addEventListener("click", () => {
-    log.scrollTop = log.scrollHeight;
+    if (state.logNewestFirst) {
+      reverseLogOrder();
+      state.logNewestFirst = false;
+      state.logTailPinned = false;
+      log.scrollTop = 0;
+      updateJumpButtonVisibility();
+    }
   });
 
   await refreshRunList();
