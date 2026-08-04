@@ -138,6 +138,12 @@ body {
     margin-left: auto; padding: 5px 8px; border-radius: 6px;
     border: 1px solid var(--border); background: var(--panel-2); color: var(--text); min-width: 180px;
 }
+.log-action-btn {
+    padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--text); cursor: pointer; font-size: 12px;
+}
+.log-action-btn:hover { filter: brightness(1.08); }
+.log-action-btn:disabled { opacity: 0.5; cursor: default; }
 
 .log-wrap { flex: 1; position: relative; min-height: 0; display: flex; flex-direction: column; }
 .log {

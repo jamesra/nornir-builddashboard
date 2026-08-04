@@ -1,11 +1,19 @@
 "use strict";
 
-const LOG_DOM_MAX = 500;
+/** Max log lines kept in the DOM (sliding window over retained history). */
+const LOG_DOM_MAX = 5000;
+/** Events fetched per history page (API clamps to 5000). */
+const LOG_PAGE_SIZE = 2000;
 
 const state = {
   runs: new Map(),       // run_id -> summary
   selectedRunId: null,
-  lastEventId: 0,        // highest event id rendered for the selected run
+  lastEventId: 0,        // highest event id seen for the selected run
+  oldestEventId: 0,      // lowest event id currently in the DOM window
+  hasMoreOlder: false,
+  loadingOlder: false,
+  loadingLog: false,
+  logSearchTimer: null,
   runFilter: "",
   logSearch: "",
   levels: new Set(["error", "warning", "info", "event", "status"]),
@@ -408,6 +416,7 @@ function formatEvent(event) {
 function updateJumpButtonVisibility() {
   const newest = el("jump-newest");
   const oldest = el("jump-oldest");
+  const loadOlder = el("load-older");
   if (!newest || !oldest) return;
   if (state.logTailPinned && state.logNewestFirst) {
     newest.classList.add("hidden");
@@ -419,6 +428,12 @@ function updateJumpButtonVisibility() {
     oldest.classList.remove("hidden");
   } else {
     oldest.classList.add("hidden");
+  }
+  if (loadOlder) {
+    loadOlder.disabled = state.loadingOlder || !state.hasMoreOlder || !state.selectedRunId;
+    loadOlder.textContent = state.hasMoreOlder
+      ? (state.loadingOlder ? "Loading…" : "Load older")
+      : "No older logs";
   }
 }
 
@@ -441,13 +456,46 @@ function reverseLogOrder() {
   log.appendChild(frag);
 }
 
-function appendLogLine(event) {
+function checkedTypesParam() {
+  return Array.from(state.levels).join(",");
+}
+
+function buildEventsQuery(extra) {
+  const params = new URLSearchParams();
+  params.set("limit", String(LOG_PAGE_SIZE));
+  const types = checkedTypesParam();
+  if (types) params.set("types", types);
+  if (state.logSearch) params.set("q", state.logSearch);
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) {
+      if (value != null && value !== "") params.set(key, String(value));
+    }
+  }
+  return params.toString();
+}
+
+function eventMatchesActiveFilters(event) {
   const key = logFilterKey(event);
-  if (key === null) return;
+  if (key === null) return false;
+  if (!state.levels.has(key)) return false;
+  if (state.logSearch) {
+    const text = formatEvent(event).toLowerCase();
+    if (!text.includes(state.logSearch) &&
+        !(JSON.stringify(event.payload || {}).toLowerCase().includes(state.logSearch))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function createLogLine(event) {
+  const key = logFilterKey(event);
+  if (key === null) return null;
 
   const line = document.createElement("div");
   line.className = "log-line " + (event.level || event.kind || "");
   line.dataset.key = key;
+  line.dataset.id = String(event.id);
   line.dataset.text = formatEvent(event).toLowerCase();
 
   const tag = event.level || (event.kind === "event" ? "event" : event.kind);
@@ -455,50 +503,170 @@ function appendLogLine(event) {
     `<span class="t">${fmtTime(event.ts)}</span>` +
     `<span class="k">${escapeHtml(tag || "")}</span>` +
     `<span class="m">${escapeHtml(formatEvent(event))}</span>`;
+  return line;
+}
 
-  applyLineVisibility(line);
+function trimLogWindow(preferKeepNewest) {
+  const log = el("log");
+  while (log.children.length > LOG_DOM_MAX) {
+    if (preferKeepNewest) {
+      // Drop oldest end of the window.
+      if (state.logNewestFirst) {
+        log.removeChild(log.lastChild);
+      } else {
+        log.removeChild(log.firstChild);
+      }
+    } else {
+      // Drop newest end while browsing history.
+      if (state.logNewestFirst) {
+        log.removeChild(log.firstChild);
+      } else {
+        log.removeChild(log.lastChild);
+      }
+    }
+  }
+  syncWindowIdsFromDom();
+}
+
+function syncWindowIdsFromDom() {
+  const log = el("log");
+  let minId = 0;
+  let maxId = state.lastEventId;
+  for (const child of log.children) {
+    const id = Number(child.dataset.id || 0);
+    if (!id) continue;
+    if (minId === 0 || id < minId) minId = id;
+    if (id > maxId) maxId = id;
+  }
+  state.oldestEventId = minId;
+  state.lastEventId = Math.max(state.lastEventId, maxId);
+}
+
+function appendLogLine(event, options) {
+  const opts = options || {};
+  const line = createLogLine(event);
+  if (!line) return;
 
   const log = el("log");
   if (state.logNewestFirst) {
+    if (opts.atOldestEnd) {
+      log.appendChild(line);
+    } else {
+      log.insertBefore(line, log.firstChild);
+    }
+  } else if (opts.atOldestEnd) {
     log.insertBefore(line, log.firstChild);
-    while (log.children.length > LOG_DOM_MAX) {
-      log.removeChild(log.lastChild);
-    }
-    if (state.logTailPinned) {
-      log.scrollTop = 0;
-    }
   } else {
     log.appendChild(line);
-    while (log.children.length > LOG_DOM_MAX) {
-      log.removeChild(log.firstChild);
-    }
-    if (state.logTailPinned) {
-      log.scrollTop = log.scrollHeight;
-    }
+  }
+
+  trimLogWindow(state.logTailPinned || !opts.atOldestEnd);
+
+  if (state.logTailPinned && !opts.atOldestEnd) {
+    log.scrollTop = state.logNewestFirst ? 0 : log.scrollHeight;
   }
 }
 
-function applyLineVisibility(line) {
-  const key = line.dataset.key;
-  const matchLevel = state.levels.has(key);
-  const matchSearch = !state.logSearch || line.dataset.text.includes(state.logSearch);
-  line.style.display = matchLevel && matchSearch ? "" : "none";
-}
-
-function refilterLog() {
-  document.querySelectorAll("#log .log-line").forEach(applyLineVisibility);
-}
-
-function renderEvents(events) {
+function renderEvents(events, options) {
+  const opts = options || {};
   for (const event of events) {
     state.lastEventId = Math.max(state.lastEventId, event.id);
-    appendLogLine(event);
+    if (state.oldestEventId === 0 || event.id < state.oldestEventId) {
+      state.oldestEventId = event.id;
+    }
+    appendLogLine(event, opts);
   }
+  updateJumpButtonVisibility();
+}
+
+async function fetchEventsPage(extra) {
+  const runId = state.selectedRunId;
+  if (!runId) return [];
+  if (state.levels.size === 0) return [];
+  const qs = buildEventsQuery(extra);
+  const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}/events?${qs}`);
+  const data = await resp.json();
+  return data.events || [];
+}
+
+async function reloadLogNewestPage() {
+  const runId = state.selectedRunId;
+  if (!runId) return;
+  state.loadingLog = true;
+  state.lastEventId = 0;
+  state.oldestEventId = 0;
+  state.hasMoreOlder = false;
+  el("log").innerHTML = "";
+  try {
+    const events = await fetchEventsPage({});
+    state.hasMoreOlder = events.length >= LOG_PAGE_SIZE;
+    renderEvents(events, {});
+    const log = el("log");
+    if (state.logNewestFirst) {
+      log.scrollTop = 0;
+    } else {
+      log.scrollTop = log.scrollHeight;
+    }
+    state.logTailPinned = true;
+  } finally {
+    state.loadingLog = false;
+    updateJumpButtonVisibility();
+  }
+}
+
+async function loadOlderEvents() {
+  if (!state.selectedRunId || state.loadingOlder || !state.hasMoreOlder) return;
+  if (state.levels.size === 0 || state.oldestEventId <= 0) return;
+
+  state.loadingOlder = true;
+  updateJumpButtonVisibility();
+  const log = el("log");
+  const prevHeight = log.scrollHeight;
+  const prevTop = log.scrollTop;
+  try {
+    const events = await fetchEventsPage({ before_id: state.oldestEventId });
+    state.hasMoreOlder = events.length >= LOG_PAGE_SIZE;
+    if (events.length) {
+      // events are ascending by id (oldest → newer within this older page).
+      const marker = state.logNewestFirst ? null : log.firstChild;
+      const toInsert = state.logNewestFirst ? events.slice().reverse() : events;
+      for (const event of toInsert) {
+        const line = createLogLine(event);
+        if (!line) continue;
+        if (state.oldestEventId === 0 || event.id < state.oldestEventId) {
+          state.oldestEventId = event.id;
+        }
+        state.lastEventId = Math.max(state.lastEventId, event.id);
+        if (state.logNewestFirst) {
+          log.appendChild(line);
+        } else {
+          log.insertBefore(line, marker);
+        }
+      }
+      trimLogWindow(false);
+      if (!state.logNewestFirst) {
+        log.scrollTop = log.scrollHeight - prevHeight + prevTop;
+      }
+    }
+  } finally {
+    state.loadingOlder = false;
+    updateJumpButtonVisibility();
+  }
+}
+
+function scheduleLogReload() {
+  if (state.logSearchTimer) clearTimeout(state.logSearchTimer);
+  state.logSearchTimer = setTimeout(() => {
+    state.logSearchTimer = null;
+    reloadLogNewestPage().catch(() => {});
+  }, 250);
 }
 
 async function selectRun(runId) {
   state.selectedRunId = runId;
   state.lastEventId = 0;
+  state.oldestEventId = 0;
+  state.hasMoreOlder = false;
   state.logTailPinned = true;
   state.logNewestFirst = true;
   el("detail-empty").classList.add("hidden");
@@ -513,26 +681,20 @@ async function selectRun(runId) {
     renderHeader(runData.run);
   }
 
-  const evResp = await fetch(`/api/runs/${encodeURIComponent(runId)}/events?limit=5000`);
-  const evData = await evResp.json();
-  renderEvents(evData.events || []);
-
-  const log = el("log");
-  log.scrollTop = 0;
-  updateJumpButtonVisibility();
+  await reloadLogNewestPage();
 }
 
 // -- websocket --------------------------------------------------------------
 
 async function fetchMissedEventsForSelectedRun() {
   const runId = state.selectedRunId;
-  if (!runId) return;
+  if (!runId || state.levels.size === 0) return;
 
-  const resp = await fetch(
-    `/api/runs/${encodeURIComponent(runId)}/events?after_id=${state.lastEventId}&limit=5000`
-  );
-  const data = await resp.json();
-  renderEvents((data.events || []).filter(e => e.id > state.lastEventId));
+  const events = await fetchEventsPage({ after_id: state.lastEventId });
+  const fresh = events.filter((e) => e.id > state.lastEventId && eventMatchesActiveFilters(e));
+  if (fresh.length) {
+    renderEvents(fresh, {});
+  }
 
   const runResp = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
   const runData = await runResp.json();
@@ -592,7 +754,9 @@ function connectWs() {
       if (data.run) renderHeader(data.run);
       if (event.id > state.lastEventId) {
         state.lastEventId = event.id;
-        appendLogLine(event);
+        if (state.logTailPinned && eventMatchesActiveFilters(event)) {
+          appendLogLine(event, {});
+        }
       }
     }
   };
@@ -608,34 +772,63 @@ function escapeHtml(value) {
     .replace(/"/g, "&quot;");
 }
 
+function downloadLogs() {
+  const runId = state.selectedRunId;
+  if (!runId) return;
+  const params = new URLSearchParams();
+  const types = checkedTypesParam();
+  if (types) params.set("types", types);
+  if (state.logSearch) params.set("q", state.logSearch);
+  const qs = params.toString();
+  const url = `/api/runs/${encodeURIComponent(runId)}/events/export${qs ? `?${qs}` : ""}`;
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `nornir-run-${runId}.log`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
 async function init() {
   el("runfilter").addEventListener("input", (e) => {
     state.runFilter = e.target.value;
     requestRenderRunList();
   });
   el("logsearch").addEventListener("input", (e) => {
-    state.logSearch = e.target.value.toLowerCase();
-    refilterLog();
+    state.logSearch = e.target.value.trim().toLowerCase();
+    scheduleLogReload();
   });
   document.querySelectorAll(".lvl").forEach((cb) => {
     cb.addEventListener("change", () => {
       if (cb.checked) state.levels.add(cb.value);
       else state.levels.delete(cb.value);
-      refilterLog();
+      scheduleLogReload();
     });
   });
 
   const log = el("log");
   log.addEventListener("scroll", () => {
-    if (!state.logTailPinned) return;
-    const unpinned = state.logNewestFirst
-      ? !isLogNearTop(log)
-      : !isLogNearBottom(log);
-    if (unpinned) {
-      state.logTailPinned = false;
-      updateJumpButtonVisibility();
+    if (state.logTailPinned) {
+      const unpinned = state.logNewestFirst
+        ? !isLogNearTop(log)
+        : !isLogNearBottom(log);
+      if (unpinned) {
+        state.logTailPinned = false;
+        updateJumpButtonVisibility();
+      }
+    }
+    const atOlderEdge = state.logNewestFirst
+      ? isLogNearBottom(log)
+      : isLogNearTop(log);
+    if (atOlderEdge) {
+      loadOlderEvents().catch(() => {});
     }
   });
+
+  el("load-older").addEventListener("click", () => {
+    loadOlderEvents().catch(() => {});
+  });
+  el("download-logs").addEventListener("click", () => downloadLogs());
 
   el("jump-newest").addEventListener("click", () => {
     if (!state.logNewestFirst) {
@@ -643,8 +836,7 @@ async function init() {
       state.logNewestFirst = true;
     }
     state.logTailPinned = true;
-    log.scrollTop = 0;
-    updateJumpButtonVisibility();
+    reloadLogNewestPage().catch(() => {});
   });
 
   el("jump-oldest").addEventListener("click", () => {
@@ -654,6 +846,7 @@ async function init() {
       state.logTailPinned = false;
       log.scrollTop = 0;
       updateJumpButtonVisibility();
+      loadOlderEvents().catch(() => {});
     }
   });
 

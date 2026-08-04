@@ -4,18 +4,25 @@ Wires together the SQLite store, the MQTT subscriber, a REST API for run/event
 history, and a WebSocket that streams live updates to connected browsers.
 """
 import asyncio
+import json
 import logging
+import os
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-import os
 
 from nornir_dashboard.config import DashboardConfig, load_config
 from nornir_dashboard.mqtt_subscriber import MqttSubscriber
-from nornir_dashboard.store import DashboardStore
+from nornir_dashboard.store import (
+    EVENTS_LIMIT_DEFAULT,
+    EVENTS_LIMIT_MAX,
+    DashboardStore,
+    clamp_events_limit,
+    parse_types_param,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -208,9 +215,69 @@ def create_app(config: DashboardConfig | None = None) -> FastAPI:
         return JSONResponse({"ok": True, "run_id": run_id})
 
     @app.get("/api/runs/{run_id}/events")
-    def get_events(run_id: str, after_id: int = 0, limit: int = 2000) -> dict[str, Any]:
-        """Return events for a run with id greater than ``after_id``."""
-        return {"events": store.get_events(run_id, after_id=after_id, limit=limit)}
+    def get_events(
+        run_id: str,
+        after_id: int = 0,
+        before_id: int = 0,
+        limit: int = EVENTS_LIMIT_DEFAULT,
+        q: str = "",
+        types: str = "",
+    ) -> dict[str, Any]:
+        """Return a page of events for a run.
+
+        Without cursors, returns the newest ``limit`` matching rows. Use
+        ``after_id`` for newer pages, ``before_id`` for older. ``q`` is a
+        case-insensitive substring of the JSON payload; ``types`` is a
+        comma-separated list of UI filter keys (error, warning, info, debug,
+        event, status).
+        """
+        limit = clamp_events_limit(limit)
+        query = q.strip() or None
+        type_list = parse_types_param(types or None)
+        return {
+            "events": store.get_events(
+                run_id,
+                after_id=after_id,
+                before_id=before_id,
+                limit=limit,
+                q=query,
+                types=type_list,
+            ),
+            "limit": limit,
+            "limit_max": EVENTS_LIMIT_MAX,
+        }
+
+    @app.get("/api/runs/{run_id}/events/export")
+    def export_events(run_id: str, q: str = "", types: str = "") -> StreamingResponse:
+        """Stream retained events for a run as plain text (oldest first)."""
+        query = q.strip() or None
+        type_list = parse_types_param(types or None)
+
+        def _lines() -> Iterator[str]:
+            for event in store.iter_events_for_export(run_id, q=query, types=type_list):
+                payload = event.get("payload") or {}
+                message = payload.get("message")
+                if message is None and event.get("kind") == "event":
+                    bits = [str(payload.get("event") or "event")]
+                    if payload.get("function"):
+                        bits.append(str(payload["function"]))
+                    if payload.get("error"):
+                        bits.append(str(payload["error"]))
+                    message = " ".join(bits)
+                elif message is None:
+                    message = json.dumps(payload, default=str)
+                level = event.get("level") or event.get("kind") or ""
+                ts = event.get("ts") or 0
+                yield f"{ts}\t{level}\t{message}\n"
+
+        filename = f"nornir-run-{run_id}.log"
+        return StreamingResponse(
+            _lines(),
+            media_type="text/plain; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

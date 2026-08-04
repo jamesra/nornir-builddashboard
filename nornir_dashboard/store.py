@@ -12,11 +12,14 @@ A single connection is shared across the MQTT subscriber thread and the
 FastAPI request handlers, guarded by a lock (SQLite connections are not safe
 for concurrent use from multiple threads).
 """
+from __future__ import annotations
+
 import json
 import os
 import sqlite3
 import threading
 import time
+from collections.abc import Iterator
 from typing import Any
 
 
@@ -33,6 +36,62 @@ _ADDED_COLUMNS = (
     ("progress_tracks", "TEXT"),
 )
 
+# Matches UI .lvl checkbox values in static/index.html / app.js logFilterKey().
+LOG_FILTER_TYPES = frozenset({"error", "warning", "info", "debug", "event", "status"})
+
+EVENTS_LIMIT_MAX = 5000
+EVENTS_LIMIT_DEFAULT = 2000
+
+
+def clamp_events_limit(limit: int) -> int:
+    """Clamp a per-request event page size to a safe range."""
+    if limit < 1:
+        return 1
+    if limit > EVENTS_LIMIT_MAX:
+        return EVENTS_LIMIT_MAX
+    return limit
+
+
+def parse_types_param(types: str | list[str] | None) -> list[str] | None:
+    """Parse a comma-separated types query into known filter keys, or None for all."""
+    if types is None:
+        return None
+    if isinstance(types, str):
+        raw = [part.strip().lower() for part in types.split(",") if part.strip()]
+    else:
+        raw = [str(part).strip().lower() for part in types if str(part).strip()]
+    if not raw:
+        return None
+    return [t for t in raw if t in LOG_FILTER_TYPES]
+
+
+def _types_sql(types: list[str] | None) -> tuple[str, list[Any]]:
+    """Build a SQL predicate matching UI log filter keys.
+
+    ``None`` means no type filter (all kinds). An empty list matches nothing.
+    """
+    if types is None:
+        return "1=1", []
+    if not types:
+        return "0=1", []
+    parts: list[str] = []
+    params: list[Any] = []
+    for t in types:
+        if t in ("error", "warning", "debug"):
+            parts.append("(kind = 'log' AND lower(COALESCE(level, '')) = ?)")
+            params.append(t)
+        elif t == "info":
+            parts.append(
+                "(kind = 'log' AND (level IS NULL OR level = '' OR lower(level) = 'info'))"
+            )
+        elif t == "event":
+            parts.append("kind = 'event'")
+        elif t == "status":
+            parts.append("kind = 'status'")
+    if not parts:
+        return "0=1", []
+    return "(" + " OR ".join(parts) + ")", params
+
 
 class DashboardStore:
     """Thread-safe SQLite store for runs and their event streams."""
@@ -41,7 +100,7 @@ class DashboardStore:
     _lock: threading.Lock
     _max_events_per_run: int
 
-    def __init__(self, database_path: str, max_events_per_run: int = 5000) -> None:
+    def __init__(self, database_path: str, max_events_per_run: int = 100000) -> None:
         if database_path != ":memory:":
             parent = os.path.dirname(os.path.abspath(database_path))
             os.makedirs(parent, exist_ok=True)
@@ -272,29 +331,97 @@ class DashboardStore:
             self._connection.commit()
         return event_id
 
-    def get_events(self, run_id: str, after_id: int = 0,
-                   limit: int = 2000) -> list[dict[str, Any]]:
-        """Return events for a run with id greater than ``after_id``."""
-        with self._lock:
-            rows = self._connection.execute(
-                """
-                SELECT id, run_id, ts, kind, level, payload FROM events
-                WHERE run_id=? AND id > ?
-                ORDER BY id ASC
-                LIMIT ?
-                """,
-                (run_id, after_id, limit),
-            ).fetchall()
+    @staticmethod
+    def _decode_event_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        """Convert an events row into a JSON-friendly dict with parsed payload."""
+        event = dict(row)
+        try:
+            event["payload"] = json.loads(event["payload"]) if event["payload"] else {}
+        except (TypeError, ValueError):
+            event["payload"] = {}
+        return event
 
-        events: list[dict[str, Any]] = []
-        for row in rows:
-            event = dict(row)
-            try:
-                event["payload"] = json.loads(event["payload"]) if event["payload"] else {}
-            except (TypeError, ValueError):
-                event["payload"] = {}
-            events.append(event)
+    def _event_filter_sql(
+        self,
+        run_id: str,
+        after_id: int,
+        before_id: int,
+        q: str | None,
+        types: list[str] | None,
+    ) -> tuple[str, list[Any]]:
+        """Shared WHERE clause for paginated and export event queries."""
+        type_sql, type_params = _types_sql(types)
+        clauses = ["run_id = ?", type_sql]
+        params: list[Any] = [run_id, *type_params]
+        if after_id > 0:
+            clauses.append("id > ?")
+            params.append(after_id)
+        if before_id > 0:
+            clauses.append("id < ?")
+            params.append(before_id)
+        if q:
+            clauses.append("lower(COALESCE(payload, '')) LIKE ?")
+            params.append(f"%{q.lower()}%")
+        return " AND ".join(clauses), params
+
+    def get_events(
+        self,
+        run_id: str,
+        after_id: int = 0,
+        before_id: int = 0,
+        limit: int = EVENTS_LIMIT_DEFAULT,
+        q: str | None = None,
+        types: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return a page of events for a run.
+
+        With neither cursor set, returns the **newest** ``limit`` matching rows
+        (ascending by id). ``after_id`` pages forward (newer); ``before_id``
+        pages backward (older). ``q`` and ``types`` filter the result set.
+        """
+        limit = clamp_events_limit(limit)
+        where_sql, params = self._event_filter_sql(run_id, after_id, before_id, q, types)
+        # Newest page or older page: fetch DESC then reverse for stable ASC order.
+        newest_or_older = after_id <= 0
+        order = "DESC" if newest_or_older else "ASC"
+        sql = (
+            f"SELECT id, run_id, ts, kind, level, payload FROM events "
+            f"WHERE {where_sql} ORDER BY id {order} LIMIT ?"
+        )
+        with self._lock:
+            rows = self._connection.execute(sql, [*params, limit]).fetchall()
+        events = [self._decode_event_row(row) for row in rows]
+        if newest_or_older:
+            events.reverse()
         return events
+
+    def iter_events_for_export(
+        self,
+        run_id: str,
+        q: str | None = None,
+        types: list[str] | None = None,
+        batch_size: int = 1000,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield matching events oldest-first for streaming export."""
+        batch_size = clamp_events_limit(batch_size)
+        where_sql, params = self._event_filter_sql(run_id, 0, 0, q, types)
+        last_id = 0
+        while True:
+            page_where = f"{where_sql} AND id > ?"
+            sql = (
+                f"SELECT id, run_id, ts, kind, level, payload FROM events "
+                f"WHERE {page_where} ORDER BY id ASC LIMIT ?"
+            )
+            with self._lock:
+                rows = self._connection.execute(
+                    sql, [*params, last_id, batch_size]
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                event = self._decode_event_row(row)
+                last_id = int(event["id"])
+                yield event
 
     def prune_events(self, run_id: str) -> None:
         """Trim a run's event history to ``max_events_per_run`` newest rows."""

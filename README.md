@@ -50,11 +50,26 @@ Publishers send to run-scoped topics:
 | `NORNIR_DASHBOARD_DB` | `./nornir-dashboard.db` | SQLite database path |
 | `NORNIR_DASHBOARD_HOST` | `0.0.0.0` | HTTP bind host |
 | `NORNIR_DASHBOARD_PORT` | `8087` | HTTP port |
-| `NORNIR_DASHBOARD_MAX_EVENTS` | `5000` | Max retained events per run |
+| `NORNIR_DASHBOARD_MAX_EVENTS` | `100000` | Max retained events per run in SQLite (`0` disables prune) |
 | `NORNIR_DASHBOARD_STALE_AFTER` | `600` | Seconds without traffic before a running build is shown as stale |
 | `NORNIR_DASHBOARD_STALE_SWEEP_INTERVAL` | `60` | How often (seconds) to re-check for stale runs |
 | `NORNIR_DASHBOARD_RETENTION_DAYS` | `30` | Auto-delete runs with no activity for this many days (`0` disables) |
 | `NORNIR_DASHBOARD_RETENTION_SWEEP_INTERVAL` | `86400` | How often (seconds) to run the retention sweeper |
+
+### Log history API and UI
+
+- `GET /api/runs/{run_id}/events` returns a page of events (default newest page).
+  Query params: `limit` (max 5000), `after_id`, `before_id` (load older),
+  `q` (case-insensitive substring of the stored JSON payload), and `types`
+  (comma-separated: `error`, `warning`, `info`, `debug`, `event`, `status`).
+  `q` and `types` combine with AND; pagination applies to the filtered set.
+  Omit `types` for all kinds (raw API); the UI always sends the checked set.
+- `GET /api/runs/{run_id}/events/export` streams the retained transcript as
+  plain text (oldest first), honoring the same `q` and `types` filters.
+- The UI keeps a bounded DOM window, loads older pages on scroll / **Load older**,
+  searches the **full retained** SQLite history (not only visible lines), applies
+  level checkboxes on the server for search / load-older / export, and offers
+  **Download logs**.
 
 ## Running locally
 

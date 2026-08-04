@@ -33,7 +33,7 @@ class DashboardConfig:
         self.http_host = os.environ.get("NORNIR_DASHBOARD_HOST", "0.0.0.0")
         self.http_port = int(os.environ.get("NORNIR_DASHBOARD_PORT", "8087"))
         self.max_events_per_run = int(
-            os.environ.get("NORNIR_DASHBOARD_MAX_EVENTS", "5000")
+            os.environ.get("NORNIR_DASHBOARD_MAX_EVENTS", "100000")
         )
         self.stale_after_seconds = float(
             os.environ.get("NORNIR_DASHBOARD_STALE_AFTER", "600")
