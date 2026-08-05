@@ -379,12 +379,59 @@ function renderHeader(run) {
   el("d-warnings").textContent = run.warning_count || 0;
   if (isTerminalStatus(status)) {
     el("d-stage").textContent = "-";
-    el("d-section").textContent = "-";
+    renderCurrentElementCard(null, true);
   } else {
     el("d-stage").textContent = run.current_stage || "-";
-    el("d-section").textContent = run.current_section || run.current_element || "-";
+    renderCurrentElementCard(run, false);
   }
   renderProgressTracks(run);
+}
+
+function looksLikeAbsPath(value) {
+  if (!value || typeof value !== "string") return false;
+  return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("\\\\");
+}
+
+function pathBasename(path) {
+  const normalized = String(path).replace(/\\/g, "/");
+  const parts = normalized.split("/");
+  return parts[parts.length - 1] || path;
+}
+
+async function copyPathToClipboard(path, button) {
+  try {
+    await navigator.clipboard.writeText(path);
+    const previous = button.textContent;
+    button.textContent = "Copied";
+    window.setTimeout(() => {
+      button.textContent = previous;
+    }, 1200);
+  } catch (_err) {
+    window.prompt("Copy path:", path);
+  }
+}
+
+function renderCurrentElementCard(run, terminal) {
+  const host = el("d-section");
+  host.replaceChildren();
+  if (terminal || !run) {
+    host.textContent = "-";
+    return;
+  }
+  const path = run.current_path || (looksLikeAbsPath(run.current_element) ? run.current_element : null);
+  if (path) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "path-copy-link";
+    btn.textContent = pathBasename(path);
+    btn.title = `${path} (click to copy)`;
+    btn.addEventListener("click", () => {
+      void copyPathToClipboard(path, btn);
+    });
+    host.appendChild(btn);
+    return;
+  }
+  host.textContent = run.current_section || run.current_element || "-";
 }
 
 function logFilterKey(event) {

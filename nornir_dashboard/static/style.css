@@ -115,6 +115,27 @@ body {
 .card { flex: 1; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; min-width: 0; }
 .card label { display: block; font-size: 10px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.05em; margin-bottom: 4px; }
 .card span { font-family: ui-monospace, monospace; font-size: 13px; word-break: break-all; }
+.card .path-copy-link {
+  display: inline;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent, #4ea1ff);
+  font: inherit;
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  word-break: break-all;
+}
+.card .path-copy-link:hover { opacity: 0.85; }
+.card .path-copy-link:focus-visible {
+  outline: 1px solid var(--accent, #4ea1ff);
+  outline-offset: 2px;
+}
 
 .progress-tracks { display: flex; flex-direction: column; gap: 8px; }
 .progress-track {

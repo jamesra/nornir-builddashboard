@@ -254,18 +254,38 @@ class MqttSubscriber:
                 fields["current_element"] = payload.get("element")
             if payload.get("section") is not None:
                 fields["current_section"] = str(payload.get("section"))
+            if payload.get("path") is not None:
+                fields["current_path"] = payload.get("path")
 
         if event_type == "iterate_progress":
             if payload.get("section") is not None:
                 fields["current_section"] = str(payload.get("section"))
-            elif payload.get("element") is not None:
+            if payload.get("element") is not None:
                 fields["current_element"] = payload.get("element")
+            if payload.get("path") is not None:
+                fields["current_path"] = payload.get("path")
             self._merge_progress_track(run_id, payload)
             # Refresh top-level progress from shallowest largest track after merge.
             self._refresh_top_level_progress(run_id)
 
+        if event_type == "iterate_progress_complete":
+            self._remove_progress_track(run_id, payload)
+            self._refresh_top_level_progress(run_id)
+
         if fields:
             self._store.update_run_fields(run_id, fields)
+
+    def _remove_progress_track(self, run_id: str, payload: dict[str, Any]) -> None:
+        """Delete a completed nested progress track from the run summary."""
+        track_id = payload.get("track_id") or payload.get("label")
+        if track_id is None:
+            return
+        tracks = dict(self._store.get_progress_tracks(run_id))
+        key = str(track_id)
+        if key not in tracks:
+            return
+        del tracks[key]
+        self._store.update_run_fields(run_id, {"progress_tracks": tracks})
 
     def _merge_progress_track(self, run_id: str, payload: dict[str, Any]) -> None:
         """Merge an iterate_progress or labeled progress update into progress_tracks."""

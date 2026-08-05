@@ -27,13 +27,14 @@ _RUN_COLUMNS = (
     "run_id", "pipeline", "volumepath", "host", "pid", "session_id",
     "status", "start_ts", "end_ts", "first_seen", "last_seen",
     "error_count", "warning_count", "current_stage", "current_element",
-    "current_section", "progress_current", "progress_total", "progress_fraction",
-    "compute", "progress_tracks",
+    "current_section", "current_path", "progress_current", "progress_total",
+    "progress_fraction", "compute", "progress_tracks",
 )
 
 _ADDED_COLUMNS = (
     ("compute", "TEXT"),
     ("progress_tracks", "TEXT"),
+    ("current_path", "TEXT"),
 )
 
 # Matches UI .lvl checkbox values in static/index.html / app.js logFilterKey().
