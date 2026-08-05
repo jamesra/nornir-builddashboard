@@ -17,6 +17,8 @@ from nornir_dashboard.store import DashboardStore
 
 logger = logging.getLogger(__name__)
 
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped", "stale"})
+
 # Callback invoked (from the MQTT network thread) with a JSON-serializable dict
 # describing a live update to broadcast to connected browsers.
 BroadcastFn = Callable[[dict[str, Any]], None]
@@ -214,17 +216,7 @@ class MqttSubscriber:
                        payload: dict[str, Any]) -> None:
         """Update the run summary columns based on a single message."""
         if kind == "meta":
-            self._store.update_run_fields(run_id, {
-                "pipeline": payload.get("pipeline"),
-                "volumepath": payload.get("volumepath"),
-                "host": payload.get("host"),
-                "pid": payload.get("pid"),
-                "session_id": payload.get("session_id"),
-                "status": payload.get("status"),
-                "start_ts": payload.get("start_ts"),
-                "end_ts": payload.get("end_ts"),
-                "compute": payload.get("compute"),
-            })
+            self._project_meta(run_id, payload)
             return
 
         if kind == "log":
@@ -240,6 +232,44 @@ class MqttSubscriber:
 
         if kind == "event":
             self._project_event(run_id, payload)
+
+    def _project_meta(self, run_id: str, payload: dict[str, Any]) -> None:
+        """Project retained/ephemeral meta onto the run row, clearing progress when needed."""
+        incoming_pipeline = payload.get("pipeline")
+        if isinstance(incoming_pipeline, str):
+            incoming_pipeline = incoming_pipeline.strip() or None
+
+        existing = self._store.get_run(run_id)
+        existing_pipeline = None
+        if existing is not None:
+            existing_pipeline = existing.get("pipeline")
+            if isinstance(existing_pipeline, str):
+                existing_pipeline = existing_pipeline.strip() or None
+
+        status = payload.get("status")
+        clear_progress = False
+        if status in _TERMINAL_STATUSES:
+            clear_progress = True
+        elif (incoming_pipeline is not None
+              and existing_pipeline is not None
+              and incoming_pipeline != existing_pipeline):
+            # --then chain segment (same run_id, new PipelineName).
+            clear_progress = True
+
+        if clear_progress:
+            self._store.clear_run_progress(run_id)
+
+        self._store.update_run_fields(run_id, {
+            "pipeline": payload.get("pipeline"),
+            "volumepath": payload.get("volumepath"),
+            "host": payload.get("host"),
+            "pid": payload.get("pid"),
+            "session_id": payload.get("session_id"),
+            "status": payload.get("status"),
+            "start_ts": payload.get("start_ts"),
+            "end_ts": payload.get("end_ts"),
+            "compute": payload.get("compute"),
+        })
 
     def _project_event(self, run_id: str, payload: dict[str, Any]) -> None:
         """Project a structured pipeline event onto the run summary."""
@@ -320,6 +350,7 @@ class MqttSubscriber:
         """Set sidebar progress from the shallowest active track with the largest total."""
         tracks = self._store.get_progress_tracks(run_id)
         if not tracks:
+            self._store.clear_run_progress(run_id)
             return
 
         def sort_key(item: tuple[str, Any]) -> tuple:

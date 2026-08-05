@@ -182,6 +182,7 @@ function renderRunList() {
 
   ul.innerHTML = "";
   for (const run of runs) {
+    if (!run.pipeline || !String(run.pipeline).trim()) continue;
     const hay = `${run.pipeline || ""} ${run.volumepath || ""} ${run.run_id}`.toLowerCase();
     if (filter && !hay.includes(filter)) continue;
 

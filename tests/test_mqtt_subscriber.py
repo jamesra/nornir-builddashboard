@@ -128,6 +128,97 @@ class TestMqttSubscriberProjection(unittest.TestCase):
         run = self.store.get_run("R1")
         self.assertEqual(run["warning_count"], 1)
 
+    def test_terminal_meta_clears_progress_tracks(self) -> None:
+        self._publish("meta", {"pipeline": "AdjustContrast", "status": "running"})
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "iterate:SectionNode",
+            "label": "section_node - 14302",
+            "depth": 0,
+            "current": 2,
+            "total": 4,
+        })
+        run = self.store.get_run("R1")
+        self.assertEqual(run["progress_total"], 4)
+        self.assertTrue(run["progress_tracks"])
+
+        self._publish("meta", {"status": "completed", "end_ts": 123.0})
+        run = self.store.get_run("R1")
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["progress_tracks"], {})
+        self.assertIsNone(run["progress_current"])
+        self.assertIsNone(run["progress_total"])
+        self.assertIsNone(run["progress_fraction"])
+        self.assertEqual(run["pipeline"], "AdjustContrast")
+
+    def test_pipeline_name_change_clears_progress_tracks(self) -> None:
+        self._publish("meta", {"pipeline": "Mosaic", "status": "running"})
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "iterate:SectionNode",
+            "label": "section",
+            "depth": 0,
+            "current": 1,
+            "total": 10,
+        })
+        self._publish("meta", {"pipeline": "Prune", "status": "running"})
+        run = self.store.get_run("R1")
+        self.assertEqual(run["pipeline"], "Prune")
+        self.assertEqual(run["progress_tracks"], {})
+        self.assertIsNone(run["progress_total"])
+
+    def test_stale_meta_clears_progress_tracks(self) -> None:
+        self._publish("meta", {"pipeline": "Assemble", "status": "running"})
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "t1",
+            "label": "t1",
+            "depth": 0,
+            "current": 3,
+            "total": 9,
+        })
+        self._publish("meta", {"status": "stale"})
+        run = self.store.get_run("R1")
+        self.assertEqual(run["progress_tracks"], {})
+        self.assertIsNone(run["progress_fraction"])
+
+
+class TestListRunsHidesUnnamed(unittest.TestCase):
+    def setUp(self) -> None:
+        self.store = DashboardStore(":memory:")
+        self.addCleanup(self.store.close)
+
+    def test_list_runs_excludes_null_pipeline(self) -> None:
+        self.store.ensure_run("stub")
+        self.store.ensure_run("named")
+        self.store.update_run_fields("named", {"pipeline": "Prune", "volumepath": "/data"})
+        runs = self.store.list_runs()
+        ids = [r["run_id"] for r in runs]
+        self.assertEqual(ids, ["named"])
+        self.assertIsNotNone(self.store.get_run("stub"))
+
+    def test_mark_stale_deletes_unnamed_and_clears_named_progress(self) -> None:
+        now = 1_000_000.0
+        self.store.ensure_run("stub", now=now - 1000)
+        self.store.update_run_fields("stub", {"last_seen": now - 1000})
+        self.store.ensure_run("named", now=now - 1000)
+        self.store.update_run_fields("named", {
+            "pipeline": "Mosaic",
+            "last_seen": now - 1000,
+            "progress_tracks": {"t": {"label": "t", "current": 1, "total": 2}},
+            "progress_total": 2,
+            "progress_current": 1,
+            "progress_fraction": 0.5,
+        })
+        stale_ids, deleted_ids = self.store.mark_stale_runs(600.0, now=now)
+        self.assertEqual(stale_ids, ["named"])
+        self.assertEqual(deleted_ids, ["stub"])
+        self.assertIsNone(self.store.get_run("stub"))
+        named = self.store.get_run("named")
+        self.assertEqual(named["status"], "stale")
+        self.assertEqual(named["progress_tracks"], {})
+        self.assertIsNone(named["progress_total"])
+
 
 if __name__ == "__main__":
     unittest.main()

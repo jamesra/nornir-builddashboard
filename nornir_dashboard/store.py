@@ -229,11 +229,16 @@ class DashboardStore:
         return result
 
     def list_runs(self, limit: int = 200) -> list[dict[str, Any]]:
-        """Return run summaries: active by last activity then start, then inactive by start."""
+        """Return named run summaries for the sidebar.
+
+        Rows without a non-empty ``pipeline`` are omitted so early MQTT stubs
+        do not appear as ``(pipeline)`` until early meta arrives.
+        """
         with self._lock:
             rows = self._connection.execute(
                 """
                 SELECT * FROM runs
+                WHERE COALESCE(TRIM(pipeline), '') != ''
                 ORDER BY
                   CASE
                     WHEN COALESCE(status, 'running') IN ('completed', 'failed', 'skipped', 'stale')
@@ -267,6 +272,24 @@ class DashboardStore:
         tracks = run.get("progress_tracks") or {}
         return tracks if isinstance(tracks, dict) else {}
 
+    def clear_run_progress(self, run_id: str) -> None:
+        """Clear nested progress tracks and top-level progress columns for a run."""
+        if not run_id:
+            return
+        with self._lock:
+            self._connection.execute(
+                """
+                UPDATE runs SET
+                  progress_tracks=?,
+                  progress_current=NULL,
+                  progress_total=NULL,
+                  progress_fraction=NULL
+                WHERE run_id=?
+                """,
+                (json.dumps({}), run_id),
+            )
+            self._connection.commit()
+
     def delete_run(self, run_id: str) -> bool:
         """Delete a run and its events. Return True when a row was removed."""
         with self._lock:
@@ -295,28 +318,56 @@ class DashboardStore:
         return [str(row["run_id"]) for row in rows]
 
     def mark_stale_runs(self, stale_after_seconds: float, now: float | None = None
-                        ) -> list[str]:
-        """Mark running runs as stale when they have not sent traffic recently."""
+                        ) -> tuple[list[str], list[str]]:
+        """Mark quiet named runs as stale; delete unnamed quiet stubs.
+
+        Returns
+        -------
+        tuple[list[str], list[str]]
+            ``(stale_named_ids, deleted_unnamed_ids)``. Named runs have
+            progress cleared when marked stale. Unnamed (null/empty pipeline)
+            pulse stubs are deleted instead of listed as ``(pipeline)``.
+        """
         if stale_after_seconds <= 0:
-            return []
+            return ([], [])
         now = time.time() if now is None else now
         cutoff = now - stale_after_seconds
+        stale_ids: list[str] = []
+        deleted_ids: list[str] = []
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT run_id FROM runs
+                SELECT run_id, pipeline FROM runs
                 WHERE status='running' AND COALESCE(last_seen, first_seen, 0) < ?
                 """,
                 (cutoff,),
             ).fetchall()
-            run_ids = [str(row["run_id"]) for row in rows]
-            for run_id in run_ids:
+            for row in rows:
+                run_id = str(row["run_id"])
+                pipeline = row["pipeline"]
+                named = bool(pipeline and str(pipeline).strip())
+                if not named:
+                    self._connection.execute(
+                        "DELETE FROM runs WHERE run_id=?", (run_id,))
+                    self._connection.execute(
+                        "DELETE FROM events WHERE run_id=?", (run_id,))
+                    deleted_ids.append(run_id)
+                    continue
                 self._connection.execute(
-                    "UPDATE runs SET status=? WHERE run_id=?",
-                    ("stale", run_id),
+                    """
+                    UPDATE runs SET
+                      status=?,
+                      progress_tracks=?,
+                      progress_current=NULL,
+                      progress_total=NULL,
+                      progress_fraction=NULL
+                    WHERE run_id=?
+                    """,
+                    ("stale", json.dumps({}), run_id),
                 )
+                stale_ids.append(run_id)
             self._connection.commit()
-        return run_ids
+        return (stale_ids, deleted_ids)
 
     # -- event helpers ----------------------------------------------------
 

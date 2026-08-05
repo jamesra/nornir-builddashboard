@@ -116,12 +116,13 @@ async def _retention_sweeper(store: DashboardStore, subscriber: MqttSubscriber,
 
 
 async def _stale_sweeper(store: DashboardStore, manager: ConnectionManager,
-                         stale_after: float, interval: float) -> None:
-    """Background task that marks quiet running builds as stale."""
+                         stale_after: float, interval: float,
+                         subscriber: MqttSubscriber | None = None) -> None:
+    """Background task that marks quiet named builds as stale and deletes unnamed stubs."""
     while True:
         try:
             if stale_after > 0:
-                stale_ids = store.mark_stale_runs(stale_after)
+                stale_ids, deleted_ids = store.mark_stale_runs(stale_after)
                 for run_id in stale_ids:
                     run = store.get_run(run_id)
                     if run is not None:
@@ -137,6 +138,13 @@ async def _stale_sweeper(store: DashboardStore, manager: ConnectionManager,
                             },
                             "run": run,
                         })
+                for run_id in deleted_ids:
+                    if subscriber is not None:
+                        subscriber.clear_retained(run_id)
+                    manager.submit_from_thread({
+                        "type": "run_deleted",
+                        "run_id": run_id,
+                    })
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Stale sweep failed: %s", exc)
         await asyncio.sleep(interval)
@@ -176,6 +184,7 @@ def create_app(config: DashboardConfig | None = None) -> FastAPI:
                     store, manager,
                     stale_after=config.stale_after_seconds,
                     interval=config.stale_sweep_interval,
+                    subscriber=subscriber,
                 )
             )
         subscriber.start()
