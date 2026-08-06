@@ -1,4 +1,10 @@
-"""Tests for event pagination, search, type filters, and export streaming."""
+"""Tests for event pagination, search, type filters, and export streaming.
+
+Manual UI checklist (log pane / Download logs):
+- Uncheck info, events, and status; leave only errors → pane shows only error lines.
+- With errors-only filter, Download logs transcript contains only error lines.
+- Re-check info → info lines reappear after reload; WebSocket inserts respect checkboxes.
+"""
 import unittest
 
 from nornir_dashboard.store import (
@@ -79,6 +85,18 @@ class TestEventsQuery(unittest.TestCase):
     def test_types_filter(self) -> None:
         hits = self.store.get_events("R1", types=["error", "event"], limit=50)
         self.assertEqual({e["id"] for e in hits}, {self.ids["error"], self.ids["event"]})
+
+    def test_types_error_only(self) -> None:
+        """types=error returns only kind=log with level=error (not events/status/info)."""
+        hits = self.store.get_events("R1", types=["error"], limit=50)
+        self.assertEqual([e["id"] for e in hits], [self.ids["error"]])
+        self.assertEqual(hits[0]["kind"], "log")
+        self.assertEqual(hits[0]["level"], "error")
+
+    def test_export_types_error_only(self) -> None:
+        exported = list(self.store.iter_events_for_export("R1", types=["error"]))
+        self.assertEqual([e["id"] for e in exported], [self.ids["error"]])
+        self.assertTrue(all(e["kind"] == "log" and e["level"] == "error" for e in exported))
 
     def test_q_and_types_combine(self) -> None:
         hits = self.store.get_events(

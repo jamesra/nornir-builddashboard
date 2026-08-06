@@ -260,6 +260,7 @@ function removeRunFromUi(runId) {
     el("detail").classList.add("hidden");
     el("detail-empty").classList.remove("hidden");
     el("log").innerHTML = "";
+    updateDownloadLogsEnabled();
   }
   requestRenderRunList();
 }
@@ -537,8 +538,9 @@ function eventMatchesActiveFilters(event) {
 }
 
 function createLogLine(event) {
+  // Enforce checkbox/search filters on every insert (API filter is not enough alone).
+  if (!eventMatchesActiveFilters(event)) return null;
   const key = logFilterKey(event);
-  if (key === null) return null;
 
   const line = document.createElement("div");
   line.className = "log-line " + (event.level || event.kind || "");
@@ -552,6 +554,34 @@ function createLogLine(event) {
     `<span class="k">${escapeHtml(tag || "")}</span>` +
     `<span class="m">${escapeHtml(formatEvent(event))}</span>`;
   return line;
+}
+
+function syncLevelsFromCheckboxes() {
+  /** Rebuild ``state.levels`` from the log-level checkboxes. */
+  state.levels = new Set(
+    Array.from(document.querySelectorAll(".lvl:checked")).map((cb) => cb.value),
+  );
+}
+
+function pruneLogDomToActiveFilters() {
+  /** Drop DOM lines that no longer match the active level/search filters. */
+  const log = el("log");
+  if (!log) return;
+  const toRemove = [];
+  for (const child of log.children) {
+    const key = child.dataset.key;
+    if (!key || !state.levels.has(key)) {
+      toRemove.push(child);
+      continue;
+    }
+    if (state.logSearch) {
+      const text = child.dataset.text || "";
+      if (!text.includes(state.logSearch)) toRemove.push(child);
+    }
+  }
+  for (const node of toRemove) node.remove();
+  syncWindowIdsFromDom();
+  updateJumpButtonVisibility();
 }
 
 function trimLogWindow(preferKeepNewest) {
@@ -720,6 +750,7 @@ async function selectRun(runId) {
   el("detail-empty").classList.add("hidden");
   el("detail").classList.remove("hidden");
   el("log").innerHTML = "";
+  updateDownloadLogsEnabled();
   renderRunList();
 
   const runResp = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
@@ -820,21 +851,38 @@ function escapeHtml(value) {
     .replace(/"/g, "&quot;");
 }
 
-function downloadLogs() {
+async function downloadLogs() {
+  /** Fetch the filtered transcript as a blob and trigger a file download. */
   const runId = state.selectedRunId;
-  if (!runId) return;
+  if (!runId || state.levels.size === 0) return;
   const params = new URLSearchParams();
   const types = checkedTypesParam();
   if (types) params.set("types", types);
   if (state.logSearch) params.set("q", state.logSearch);
   const qs = params.toString();
   const url = `/api/runs/${encodeURIComponent(runId)}/events/export${qs ? `?${qs}` : ""}`;
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `nornir-run-${runId}.log`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+  const filename = `nornir-run-${runId}.log`;
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`export failed: ${resp.status}`);
+    const blob = await resp.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(objectUrl);
+  } catch (err) {
+    console.error("Download logs failed", err);
+  }
+}
+
+function updateDownloadLogsEnabled() {
+  const btn = el("download-logs");
+  if (!btn) return;
+  btn.disabled = !state.selectedRunId || state.levels.size === 0;
 }
 
 async function init() {
@@ -844,15 +892,19 @@ async function init() {
   });
   el("logsearch").addEventListener("input", (e) => {
     state.logSearch = e.target.value.trim().toLowerCase();
+    pruneLogDomToActiveFilters();
     scheduleLogReload();
   });
   document.querySelectorAll(".lvl").forEach((cb) => {
     cb.addEventListener("change", () => {
-      if (cb.checked) state.levels.add(cb.value);
-      else state.levels.delete(cb.value);
+      syncLevelsFromCheckboxes();
+      pruneLogDomToActiveFilters();
+      updateDownloadLogsEnabled();
       scheduleLogReload();
     });
   });
+  syncLevelsFromCheckboxes();
+  updateDownloadLogsEnabled();
 
   const log = el("log");
   log.addEventListener("scroll", () => {
@@ -876,7 +928,9 @@ async function init() {
   el("load-older").addEventListener("click", () => {
     loadOlderEvents().catch(() => {});
   });
-  el("download-logs").addEventListener("click", () => downloadLogs());
+  el("download-logs").addEventListener("click", () => {
+    downloadLogs().catch(() => {});
+  });
 
   el("jump-newest").addEventListener("click", () => {
     if (!state.logNewestFirst) {
