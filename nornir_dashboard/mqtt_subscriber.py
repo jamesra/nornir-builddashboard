@@ -279,7 +279,14 @@ class MqttSubscriber:
         if event_type in ("stage_start", "stage_end", "stage_failed"):
             module = payload.get("module", "")
             function = payload.get("function", "")
-            fields["current_stage"] = f"{module}.{function}".strip(".")
+            new_stage = f"{module}.{function}".strip(".")
+            if event_type == "stage_start":
+                existing = self._store.get_run(run_id)
+                existing_stage = None if existing is None else existing.get("current_stage")
+                if existing_stage and existing_stage != new_stage:
+                    # Drop sticky nested tracks when Current Stage / Command changes.
+                    self._store.clear_run_progress(run_id)
+            fields["current_stage"] = new_stage
             if payload.get("element") is not None:
                 fields["current_element"] = payload.get("element")
             if payload.get("section") is not None:
@@ -299,23 +306,13 @@ class MqttSubscriber:
             self._refresh_top_level_progress(run_id)
 
         if event_type == "iterate_progress_complete":
-            self._remove_progress_track(run_id, payload)
+            # Keep the last track snapshot sticky until current_stage changes
+            # (or terminal / pipeline rename clears progress). Avoids ChannelNode
+            # flicker between sections of the same stage.
             self._refresh_top_level_progress(run_id)
 
         if fields:
             self._store.update_run_fields(run_id, fields)
-
-    def _remove_progress_track(self, run_id: str, payload: dict[str, Any]) -> None:
-        """Delete a completed nested progress track from the run summary."""
-        track_id = payload.get("track_id") or payload.get("label")
-        if track_id is None:
-            return
-        tracks = dict(self._store.get_progress_tracks(run_id))
-        key = str(track_id)
-        if key not in tracks:
-            return
-        del tracks[key]
-        self._store.update_run_fields(run_id, {"progress_tracks": tracks})
 
     def _merge_progress_track(self, run_id: str, payload: dict[str, Any]) -> None:
         """Merge an iterate_progress or labeled progress update into progress_tracks."""

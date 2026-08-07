@@ -19,6 +19,8 @@ const state = {
   levels: new Set(["error", "warning", "info", "event", "status"]),
   logTailPinned: true,
   logNewestFirst: true,
+  /** Last header snapshot string for the selected run; skip DOM rebuild when unchanged. */
+  lastHeaderSnapshot: null,
 };
 
 const el = (id) => document.getElementById(id);
@@ -257,6 +259,7 @@ function removeRunFromUi(runId) {
   state.runs.delete(runId);
   if (state.selectedRunId === runId) {
     state.selectedRunId = null;
+    state.lastHeaderSnapshot = null;
     el("detail").classList.add("hidden");
     el("detail-empty").classList.remove("hidden");
     el("log").innerHTML = "";
@@ -365,8 +368,38 @@ function renderProgressTracks(run) {
   }
 }
 
-function renderHeader(run) {
+function headerSnapshot(run) {
+  /** Stable string of header/progress fields (excludes runtime; tickRuntimes owns that). */
+  if (!run) return "";
+  return JSON.stringify({
+    run_id: run.run_id || null,
+    pipeline: run.pipeline || null,
+    status: run.status || null,
+    volumepath: run.volumepath || null,
+    host: run.host || null,
+    compute: run.compute || null,
+    error_count: run.error_count || 0,
+    warning_count: run.warning_count || 0,
+    current_stage: run.current_stage || null,
+    current_section: run.current_section || null,
+    current_element: run.current_element || null,
+    current_path: run.current_path || null,
+    progress_current: run.progress_current ?? null,
+    progress_total: run.progress_total ?? null,
+    progress_fraction: run.progress_fraction ?? null,
+    progress_tracks: run.progress_tracks || {},
+  });
+}
+
+function renderHeader(run, options) {
   if (!run) return;
+  const force = options && options.force;
+  const snap = headerSnapshot(run);
+  if (!force && snap === state.lastHeaderSnapshot) {
+    return;
+  }
+  state.lastHeaderSnapshot = snap;
+
   el("d-pipeline").textContent = run.pipeline || "(pipeline)";
   const status = run.status || "running";
   const badge = el("d-status");
@@ -747,6 +780,7 @@ async function selectRun(runId) {
   state.hasMoreOlder = false;
   state.logTailPinned = true;
   state.logNewestFirst = true;
+  state.lastHeaderSnapshot = null;
   el("detail-empty").classList.add("hidden");
   el("detail").classList.remove("hidden");
   el("log").innerHTML = "";
@@ -757,7 +791,7 @@ async function selectRun(runId) {
   const runData = await runResp.json();
   if (runData.run) {
     upsertRun(runData.run);
-    renderHeader(runData.run);
+    renderHeader(runData.run, { force: true });
   }
 
   await reloadLogNewestPage();

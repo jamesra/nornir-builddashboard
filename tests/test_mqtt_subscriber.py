@@ -92,7 +92,7 @@ class TestMqttSubscriberProjection(unittest.TestCase):
             "/storage4/RC2/TEM/Grid16/1334-1333_ctrl-TEM_Leveled_map-TEM_Leveled.stos",
         )
 
-    def test_iterate_progress_complete_removes_track(self) -> None:
+    def test_iterate_progress_complete_keeps_track(self) -> None:
         self._publish("event", {
             "event": "iterate_progress",
             "track_id": "import_idoc:sections",
@@ -117,11 +117,85 @@ class TestMqttSubscriberProjection(unittest.TestCase):
         })
         run = self.store.get_run("R1")
         tracks = run["progress_tracks"]
-        self.assertNotIn("import_idoc:tiles", tracks)
+        # Nested complete keeps the last snapshot sticky until stage changes.
+        self.assertIn("import_idoc:tiles", tracks)
+        self.assertEqual(tracks["import_idoc:tiles"]["current"], 10)
         self.assertIn("import_idoc:sections", tracks)
-        # Top-level falls back to remaining shallowest track
+        # Top-level still driven by shallowest largest track
         self.assertEqual(run["progress_total"], 5)
         self.assertEqual(run["progress_current"], 1)
+
+    def test_stage_start_different_stage_clears_progress_tracks(self) -> None:
+        self._publish("event", {
+            "event": "stage_start",
+            "module": "nornir_buildmanager.operations.channel",
+            "function": "CreateBlobFilter",
+        })
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "iterate:ChannelNode",
+            "label": "ChannelNode - TEM",
+            "depth": 1,
+            "current": 1,
+            "total": 1,
+        })
+        run = self.store.get_run("R1")
+        self.assertTrue(run["progress_tracks"])
+
+        self._publish("event", {
+            "event": "stage_start",
+            "module": "nornir_buildmanager.operations.tile",
+            "function": "Assemble",
+        })
+        run = self.store.get_run("R1")
+        self.assertEqual(
+            run["current_stage"],
+            "nornir_buildmanager.operations.tile.Assemble",
+        )
+        self.assertEqual(run["progress_tracks"], {})
+        self.assertIsNone(run["progress_total"])
+
+    def test_stage_start_same_stage_keeps_progress_tracks(self) -> None:
+        self._publish("event", {
+            "event": "stage_start",
+            "module": "nornir_buildmanager.operations.channel",
+            "function": "CreateBlobFilter",
+        })
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "iterate:SectionNode",
+            "label": "section_node - 0769",
+            "depth": 0,
+            "current": 618,
+            "total": 1336,
+            "section": 769,
+        })
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "iterate:ChannelNode",
+            "label": "ChannelNode - TEM",
+            "depth": 1,
+            "current": 1,
+            "total": 1,
+        })
+        self._publish("event", {
+            "event": "iterate_progress_complete",
+            "track_id": "iterate:ChannelNode",
+            "total": 1,
+        })
+        # Same CreateBlobFilter stage for the next section must not clear tracks.
+        self._publish("event", {
+            "event": "stage_start",
+            "module": "nornir_buildmanager.operations.channel",
+            "function": "CreateBlobFilter",
+            "section": 770,
+        })
+        run = self.store.get_run("R1")
+        tracks = run["progress_tracks"]
+        self.assertIn("iterate:ChannelNode", tracks)
+        self.assertIn("iterate:SectionNode", tracks)
+        self.assertEqual(run["progress_total"], 1336)
+        self.assertEqual(run["current_section"], "770")
 
     def test_warning_increments_counter(self) -> None:
         self._publish("log/warning", {"message": "missing file"})
