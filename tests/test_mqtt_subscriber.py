@@ -225,8 +225,25 @@ class TestMqttSubscriberProjection(unittest.TestCase):
         self.assertIsNone(run["progress_fraction"])
         self.assertEqual(run["pipeline"], "AdjustContrast")
 
-    def test_pipeline_name_change_clears_progress_tracks(self) -> None:
-        self._publish("meta", {"pipeline": "Mosaic", "status": "running"})
+    def test_pipeline_name_change_clears_in_pipeline_tracks_keeps_chain(self) -> None:
+        self._publish("meta", {"pipeline": "Mosaic (1/2)", "status": "running", "start_ts": 100.0})
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "chain",
+            "label": "Pipelines",
+            "depth": 0,
+            "current": 0,
+            "total": 2,
+        })
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "pipeline:Mosaic",
+            "label": "Mosaic",
+            "depth": 0,
+            "current": 1,
+            "total": 1,
+            "fraction": 1.0,
+        })
         self._publish("event", {
             "event": "iterate_progress",
             "track_id": "iterate:SectionNode",
@@ -235,11 +252,80 @@ class TestMqttSubscriberProjection(unittest.TestCase):
             "current": 1,
             "total": 10,
         })
-        self._publish("meta", {"pipeline": "Prune", "status": "running"})
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "iterate:ChannelNode",
+            "label": "channel",
+            "depth": 1,
+            "current": 1,
+            "total": 2,
+        })
+        self._publish("log/error", {"message": "boom early", "ts": 1.0})
+        self._publish("meta", {"pipeline": "Prune (2/2)", "status": "running"})
         run = self.store.get_run("R1")
-        self.assertEqual(run["pipeline"], "Prune")
-        self.assertEqual(run["progress_tracks"], {})
-        self.assertIsNone(run["progress_total"])
+        self.assertEqual(run["pipeline"], "Prune (2/2)")
+        tracks = run["progress_tracks"]
+        self.assertIn("chain", tracks)
+        self.assertIn("pipeline:Mosaic", tracks)
+        self.assertNotIn("iterate:SectionNode", tracks)
+        self.assertNotIn("iterate:ChannelNode", tracks)
+        self.assertEqual(run["start_ts"], 100.0)
+        # Top-level refreshes from remaining shallowest track (chain).
+        self.assertEqual(run["progress_total"], 2)
+        # --then renames clear in-pipeline bars only — never wipe the transcript.
+        errors = self.store.get_events("R1", types=["error"], limit=50)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["payload"].get("message"), "boom early")
+        self.assertEqual(run["error_count"], 1)
+
+    def test_meta_without_start_ts_preserves_existing(self) -> None:
+        self._publish("meta", {
+            "pipeline": "Mosaic (1/2)",
+            "status": "running",
+            "start_ts": 50.0,
+            "volumepath": "/data",
+        })
+        self._publish("meta", {
+            "pipeline": "Prune (2/2)",
+            "status": "running",
+            "volumepath": "/data",
+        })
+        run = self.store.get_run("R1")
+        self.assertEqual(run["pipeline"], "Prune (2/2)")
+        self.assertEqual(run["start_ts"], 50.0)
+
+    def test_stage_start_keeps_chain_progress_tracks(self) -> None:
+        self._publish("event", {
+            "event": "stage_start",
+            "module": "nornir_buildmanager.operations.channel",
+            "function": "CreateBlobFilter",
+        })
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "chain",
+            "label": "Pipelines",
+            "depth": 0,
+            "current": 1,
+            "total": 3,
+        })
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "iterate:SectionNode",
+            "label": "section",
+            "depth": 0,
+            "current": 2,
+            "total": 10,
+        })
+        self._publish("event", {
+            "event": "stage_start",
+            "module": "nornir_buildmanager.operations.tile",
+            "function": "Assemble",
+        })
+        run = self.store.get_run("R1")
+        tracks = run["progress_tracks"]
+        self.assertIn("chain", tracks)
+        self.assertNotIn("iterate:SectionNode", tracks)
+        self.assertEqual(run["progress_total"], 3)
 
     def test_stale_meta_clears_progress_tracks(self) -> None:
         self._publish("meta", {"pipeline": "Assemble", "status": "running"})
@@ -255,6 +341,80 @@ class TestMqttSubscriberProjection(unittest.TestCase):
         run = self.store.get_run("R1")
         self.assertEqual(run["progress_tracks"], {})
         self.assertIsNone(run["progress_fraction"])
+
+    def test_pool_load_merges_into_pool_tracks(self) -> None:
+        self._publish("meta", {"pipeline": "Assemble", "status": "running"})
+        self._publish("event", {
+            "event": "pool_load",
+            "name": "Global thread pool",
+            "queued": 4,
+            "active": 2,
+            "outstanding": 6,
+            "max_workers": 8,
+        })
+        run = self.store.get_run("R1")
+        pools = run["pool_tracks"]
+        self.assertIn("Global thread pool", pools)
+        self.assertEqual(pools["Global thread pool"]["outstanding"], 6)
+        self.assertEqual(pools["Global thread pool"]["active"], 2)
+        self.assertEqual(pools["Global thread pool"]["queued"], 4)
+        # Must not steal top-level stage progress.
+        self.assertIsNone(run.get("progress_total"))
+
+    def test_stage_change_clears_pool_tracks(self) -> None:
+        self._publish("event", {
+            "event": "stage_start",
+            "module": "ops",
+            "function": "First",
+        })
+        self._publish("event", {
+            "event": "pool_load",
+            "name": "unit-pool",
+            "queued": 1,
+            "active": 1,
+            "outstanding": 2,
+        })
+        self.assertTrue(self.store.get_run("R1")["pool_tracks"])
+        self._publish("event", {
+            "event": "stage_start",
+            "module": "ops",
+            "function": "Second",
+        })
+        run = self.store.get_run("R1")
+        self.assertEqual(run["pool_tracks"], {})
+
+    def test_terminal_meta_clears_pool_tracks(self) -> None:
+        self._publish("meta", {"pipeline": "Assemble", "status": "running"})
+        self._publish("event", {
+            "event": "pool_load",
+            "name": "unit-pool",
+            "queued": 2,
+            "active": 0,
+            "outstanding": 2,
+        })
+        self._publish("meta", {"status": "completed", "end_ts": 1.0})
+        run = self.store.get_run("R1")
+        self.assertEqual(run["pool_tracks"], {})
+
+    def test_iterate_progress_not_persisted_to_events(self) -> None:
+        self._publish("log/error", {"message": "keep me"})
+        for i in range(20):
+            self._publish("event", {
+                "event": "iterate_progress",
+                "track_id": "iterate:SectionNode",
+                "label": "section",
+                "depth": 0,
+                "current": i,
+                "total": 20,
+            })
+        self._publish("meta", {"pipeline": "Assemble", "status": "running"})
+        count = sum(1 for _ in self.store.iter_events_for_export("R1"))
+        self.assertEqual(count, 1)
+        errors = self.store.get_events("R1", types=["error"], limit=10)
+        self.assertEqual(len(errors), 1)
+        run = self.store.get_run("R1")
+        self.assertEqual(run["progress_total"], 20)
+        self.assertEqual(run["pipeline"], "Assemble")
 
 
 class TestListRunsHidesUnnamed(unittest.TestCase):

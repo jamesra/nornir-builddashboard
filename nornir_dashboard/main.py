@@ -23,6 +23,7 @@ from nornir_dashboard.store import (
     clamp_events_limit,
     parse_types_param,
 )
+from nornir_dashboard.ws_broadcast import coalesce_broadcast_messages
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,8 @@ class ConnectionManager:
 
     The MQTT subscriber runs on a paho network thread, so updates are marshalled
     onto the asyncio event loop via a thread-safe queue before delivery.
+    Under flood, queued ``event`` messages are drained and coalesced into a
+    single ``event_batch`` WebSocket frame per wake-up.
     """
 
     _loop: asyncio.AbstractEventLoop | None
@@ -64,18 +67,29 @@ class ConnectionManager:
         """Stop tracking a disconnected WebSocket client."""
         self._clients.discard(websocket)
 
+    async def _send_to_clients(self, message: dict[str, Any]) -> None:
+        """Deliver one frame to all connected clients, dropping dead sockets."""
+        stale: list[WebSocket] = []
+        for client in list(self._clients):
+            try:
+                await client.send_json(message)
+            except Exception:
+                stale.append(client)
+        for client in stale:
+            self._clients.discard(client)
+
     async def broadcaster(self) -> None:
         """Background task that delivers queued messages to all clients."""
         while True:
-            message = await self._queue.get()
-            stale: list[WebSocket] = []
-            for client in list(self._clients):
+            first = await self._queue.get()
+            drained: list[dict[str, Any]] = [first]
+            while True:
                 try:
-                    await client.send_json(message)
-                except Exception:
-                    stale.append(client)
-            for client in stale:
-                self._clients.discard(client)
+                    drained.append(self._queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            for message in coalesce_broadcast_messages(drained):
+                await self._send_to_clients(message)
 
 
 def _delete_run_and_notify(store: DashboardStore, subscriber: MqttSubscriber,

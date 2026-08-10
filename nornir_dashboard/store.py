@@ -28,13 +28,14 @@ _RUN_COLUMNS = (
     "status", "start_ts", "end_ts", "first_seen", "last_seen",
     "error_count", "warning_count", "current_stage", "current_element",
     "current_section", "current_path", "progress_current", "progress_total",
-    "progress_fraction", "compute", "progress_tracks",
+    "progress_fraction", "compute", "progress_tracks", "pool_tracks",
 )
 
 _ADDED_COLUMNS = (
     ("compute", "TEXT"),
     ("progress_tracks", "TEXT"),
     ("current_path", "TEXT"),
+    ("pool_tracks", "TEXT"),
 )
 
 # Matches UI .lvl checkbox values in static/index.html / app.js logFilterKey().
@@ -97,9 +98,14 @@ def _types_sql(types: list[str] | None) -> tuple[str, list[Any]]:
 class DashboardStore:
     """Thread-safe SQLite store for runs and their event streams."""
 
+    # How many inserts between prune passes. Pruning every message forces a
+    # DELETE subquery + commit per MQTT log line and dominates under floods.
+    _PRUNE_EVERY: int = 1000
+
     _connection: sqlite3.Connection
     _lock: threading.Lock
     _max_events_per_run: int
+    _events_since_prune: dict[str, int]
 
     def __init__(self, database_path: str, max_events_per_run: int = 100000) -> None:
         if database_path != ":memory:":
@@ -110,6 +116,7 @@ class DashboardStore:
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._max_events_per_run = max_events_per_run
+        self._events_since_prune = {}
         self._initialize_schema()
 
     def _initialize_schema(self) -> None:
@@ -193,6 +200,8 @@ class DashboardStore:
 
         if "progress_tracks" in updates and not isinstance(updates["progress_tracks"], str):
             updates["progress_tracks"] = json.dumps(updates["progress_tracks"], default=str)
+        if "pool_tracks" in updates and not isinstance(updates["pool_tracks"], str):
+            updates["pool_tracks"] = json.dumps(updates["pool_tracks"], default=str)
 
         assignments = ", ".join(f"{column}=?" for column in updates)
         values = list(updates.values())
@@ -216,16 +225,17 @@ class DashboardStore:
 
     @staticmethod
     def _decode_run_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
-        """Convert a runs row into a JSON-friendly dict with parsed progress_tracks."""
+        """Convert a runs row into a JSON-friendly dict with parsed track maps."""
         result = dict(row)
-        raw_tracks = result.get("progress_tracks")
-        if isinstance(raw_tracks, str) and raw_tracks:
-            try:
-                result["progress_tracks"] = json.loads(raw_tracks)
-            except (TypeError, ValueError):
-                result["progress_tracks"] = {}
-        elif raw_tracks is None:
-            result["progress_tracks"] = {}
+        for key in ("progress_tracks", "pool_tracks"):
+            raw = result.get(key)
+            if isinstance(raw, str) and raw:
+                try:
+                    result[key] = json.loads(raw)
+                except (TypeError, ValueError):
+                    result[key] = {}
+            elif raw is None:
+                result[key] = {}
         return result
 
     def list_runs(self, limit: int = 200) -> list[dict[str, Any]]:
@@ -272,8 +282,16 @@ class DashboardStore:
         tracks = run.get("progress_tracks") or {}
         return tracks if isinstance(tracks, dict) else {}
 
+    def get_pool_tracks(self, run_id: str) -> dict[str, Any]:
+        """Return the pool_tracks map for a run (empty dict when unset)."""
+        run = self.get_run(run_id)
+        if run is None:
+            return {}
+        tracks = run.get("pool_tracks") or {}
+        return tracks if isinstance(tracks, dict) else {}
+
     def clear_run_progress(self, run_id: str) -> None:
-        """Clear nested progress tracks and top-level progress columns for a run."""
+        """Clear nested progress/pool tracks and top-level progress columns for a run."""
         if not run_id:
             return
         with self._lock:
@@ -281,12 +299,13 @@ class DashboardStore:
                 """
                 UPDATE runs SET
                   progress_tracks=?,
+                  pool_tracks=?,
                   progress_current=NULL,
                   progress_total=NULL,
                   progress_fraction=NULL
                 WHERE run_id=?
                 """,
-                (json.dumps({}), run_id),
+                (json.dumps({}), json.dumps({}), run_id),
             )
             self._connection.commit()
 
@@ -358,12 +377,13 @@ class DashboardStore:
                     UPDATE runs SET
                       status=?,
                       progress_tracks=?,
+                      pool_tracks=?,
                       progress_current=NULL,
                       progress_total=NULL,
                       progress_fraction=NULL
                     WHERE run_id=?
                     """,
-                    ("stale", json.dumps({}), run_id),
+                    ("stale", json.dumps({}), json.dumps({}), run_id),
                 )
                 stale_ids.append(run_id)
             self._connection.commit()
@@ -373,7 +393,12 @@ class DashboardStore:
 
     def add_event(self, run_id: str, ts: float, kind: str, level: str | None,
                   payload: dict[str, Any]) -> int:
-        """Append an event for a run and return its row id."""
+        """Append an event for a run and return its row id.
+
+        Periodically prunes when ``max_events_per_run`` is set so floods do not
+        pay for a DELETE on every insert.
+        """
+        should_prune = False
         with self._lock:
             cursor = self._connection.execute(
                 "INSERT INTO events (run_id, ts, kind, level, payload) VALUES (?, ?, ?, ?, ?)",
@@ -381,6 +406,15 @@ class DashboardStore:
             )
             event_id = int(cursor.lastrowid)
             self._connection.commit()
+            if self._max_events_per_run > 0:
+                count = self._events_since_prune.get(run_id, 0) + 1
+                if count >= self._PRUNE_EVERY:
+                    self._events_since_prune[run_id] = 0
+                    should_prune = True
+                else:
+                    self._events_since_prune[run_id] = count
+        if should_prune:
+            self.prune_events(run_id)
         return event_id
 
     @staticmethod
@@ -476,18 +510,66 @@ class DashboardStore:
                 yield event
 
     def prune_events(self, run_id: str) -> None:
-        """Trim a run's event history to ``max_events_per_run`` newest rows."""
+        """Trim a run's event history to ``max_events_per_run`` rows.
+
+        Prefer keeping ``log`` error/warning rows so counters stay inspectable;
+        fill any remaining budget with the newest other events. A plain
+        newest-N prune was discarding early errors under ``iterate_progress``
+        floods (including long ``--then`` chains) while ``error_count`` stayed.
+        """
         if self._max_events_per_run <= 0:
             return
+        limit = self._max_events_per_run
         with self._lock:
-            self._connection.execute(
+            total = int(self._connection.execute(
+                "SELECT COUNT(*) FROM events WHERE run_id=?", (run_id,)
+            ).fetchone()[0])
+            if total <= limit:
+                return
+
+            protected_rows = self._connection.execute(
                 """
-                DELETE FROM events
-                WHERE run_id=? AND id NOT IN (
-                    SELECT id FROM events WHERE run_id=? ORDER BY id DESC LIMIT ?
-                )
+                SELECT id FROM events
+                WHERE run_id=?
+                  AND kind='log'
+                  AND lower(COALESCE(level, '')) IN ('error', 'warning')
+                ORDER BY id DESC
+                LIMIT ?
                 """,
-                (run_id, run_id, self._max_events_per_run),
+                (run_id, limit),
+            ).fetchall()
+            keep_ids = {int(row[0]) for row in protected_rows}
+            remaining = limit - len(keep_ids)
+            if remaining > 0:
+                if keep_ids:
+                    placeholders = ",".join("?" * len(keep_ids))
+                    other_rows = self._connection.execute(
+                        f"""
+                        SELECT id FROM events
+                        WHERE run_id=? AND id NOT IN ({placeholders})
+                        ORDER BY id DESC
+                        LIMIT ?
+                        """,
+                        (run_id, *keep_ids, remaining),
+                    ).fetchall()
+                else:
+                    other_rows = self._connection.execute(
+                        """
+                        SELECT id FROM events
+                        WHERE run_id=?
+                        ORDER BY id DESC
+                        LIMIT ?
+                        """,
+                        (run_id, remaining),
+                    ).fetchall()
+                keep_ids.update(int(row[0]) for row in other_rows)
+
+            if not keep_ids:
+                return
+            placeholders = ",".join("?" * len(keep_ids))
+            self._connection.execute(
+                f"DELETE FROM events WHERE run_id=? AND id NOT IN ({placeholders})",
+                (run_id, *keep_ids),
             )
             self._connection.commit()
 

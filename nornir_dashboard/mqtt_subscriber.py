@@ -19,6 +19,33 @@ logger = logging.getLogger(__name__)
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped", "stale"})
 
+# High-churn telemetry: project into run summary + live WS, but do not append to
+# the SQLite transcript. Otherwise iterate_progress floods prune away real errors.
+_EPHEMERAL_EVENT_KINDS = frozenset({"progress", "meta"})
+_EPHEMERAL_EVENT_TYPES = frozenset({
+    "iterate_progress",
+    "iterate_progress_complete",
+    "pool_load",
+})
+
+
+def _is_chain_progress_track(track_id: str) -> bool:
+    """True for sticky ``--then`` chain bars (``chain`` / ``pipeline:*``)."""
+    tid = str(track_id)
+    return tid == "chain" or tid.startswith("pipeline:")
+
+
+def _should_persist_event(kind: str, payload: dict[str, Any]) -> bool:
+    """Return False for high-churn kinds that must not displace log rows."""
+    if kind in _EPHEMERAL_EVENT_KINDS:
+        return False
+    if kind == "event":
+        event_type = payload.get("event")
+        if isinstance(event_type, str) and event_type in _EPHEMERAL_EVENT_TYPES:
+            return False
+    return True
+
+
 # Callback invoked (from the MQTT network thread) with a JSON-serializable dict
 # describing a live update to broadcast to connected browsers.
 BroadcastFn = Callable[[dict[str, Any]], None]
@@ -167,12 +194,15 @@ class MqttSubscriber:
         kind, level = self._classify(leaf)
         self._project_state(run_id, kind, level, payload)
 
-        event_id = self._store.add_event(run_id, ts, kind, level, payload)
-        self._store.prune_events(run_id)
+        persist = _should_persist_event(kind, payload)
+        event_id = 0
+        if persist:
+            event_id = self._store.add_event(run_id, ts, kind, level, payload)
 
-        run_summary = self._store.get_run(run_id)
-
-        self._broadcast({
+        # Info/debug log floods do not change sidebar counters; skip the full
+        # run summary read+broadcast payload so WS stays usable under load.
+        include_run = kind != "log" or level in ("error", "warning")
+        message: dict[str, Any] = {
             "type": "event",
             "event": {
                 "id": event_id,
@@ -182,8 +212,10 @@ class MqttSubscriber:
                 "level": level,
                 "payload": payload,
             },
-            "run": run_summary,
-        })
+        }
+        if include_run:
+            message["run"] = self._store.get_run(run_id)
+        self._broadcast(message)
 
     def _parse_topic(self, topic: str) -> tuple[str | None, str | None]:
         """Split a topic into ``(run_id, leaf)`` relative to the topic root."""
@@ -247,17 +279,14 @@ class MqttSubscriber:
                 existing_pipeline = existing_pipeline.strip() or None
 
         status = payload.get("status")
-        clear_progress = False
         if status in _TERMINAL_STATUSES:
-            clear_progress = True
+            self._store.clear_run_progress(run_id)
         elif (incoming_pipeline is not None
               and existing_pipeline is not None
               and incoming_pipeline != existing_pipeline):
-            # --then chain segment (same run_id, new PipelineName).
-            clear_progress = True
-
-        if clear_progress:
-            self._store.clear_run_progress(run_id)
+            # --then chain segment (same run_id, new PipelineName): drop nested
+            # iterate bars but keep depth-0 chain / pipeline:* tracks.
+            self._clear_in_pipeline_progress(run_id)
 
         self._store.update_run_fields(run_id, {
             "pipeline": payload.get("pipeline"),
@@ -270,6 +299,28 @@ class MqttSubscriber:
             "end_ts": payload.get("end_ts"),
             "compute": payload.get("compute"),
         })
+
+    def _clear_in_pipeline_progress(self, run_id: str) -> None:
+        """Remove in-pipeline progress tracks; keep sticky chain/pipeline bars.
+
+        Also clears pool load tracks (they are stage-scoped load snapshots).
+        """
+        self._store.update_run_fields(run_id, {"pool_tracks": {}})
+        tracks = self._store.get_progress_tracks(run_id)
+        if not tracks:
+            return
+        kept = {
+            tid: track for tid, track in tracks.items()
+            if _is_chain_progress_track(tid)
+        }
+        if len(kept) == len(tracks):
+            return
+        if not kept:
+            # Preserve pool clear already applied; still clear progress columns.
+            self._store.clear_run_progress(run_id)
+            return
+        self._store.update_run_fields(run_id, {"progress_tracks": kept})
+        self._refresh_top_level_progress(run_id)
 
     def _project_event(self, run_id: str, payload: dict[str, Any]) -> None:
         """Project a structured pipeline event onto the run summary."""
@@ -284,8 +335,9 @@ class MqttSubscriber:
                 existing = self._store.get_run(run_id)
                 existing_stage = None if existing is None else existing.get("current_stage")
                 if existing_stage and existing_stage != new_stage:
-                    # Drop sticky nested tracks when Current Stage / Command changes.
-                    self._store.clear_run_progress(run_id)
+                    # Drop sticky nested tracks when Current Stage / Command changes;
+                    # keep --then chain / pipeline:* bars.
+                    self._clear_in_pipeline_progress(run_id)
             fields["current_stage"] = new_stage
             if payload.get("element") is not None:
                 fields["current_element"] = payload.get("element")
@@ -311,8 +363,38 @@ class MqttSubscriber:
             # flicker between sections of the same stage.
             self._refresh_top_level_progress(run_id)
 
+        if event_type == "pool_load":
+            self._merge_pool_track(run_id, payload)
+
         if fields:
             self._store.update_run_fields(run_id, fields)
+
+    def _merge_pool_track(self, run_id: str, payload: dict[str, Any]) -> None:
+        """Merge a ``pool_load`` event into the run ``pool_tracks`` map."""
+        name = payload.get("name") or payload.get("label") or "pool"
+        key = str(name)
+        queued = payload.get("queued")
+        active = payload.get("active")
+        outstanding = payload.get("outstanding")
+        if outstanding is None:
+            try:
+                q = int(queued or 0)
+                a = int(active) if active is not None else 0
+                outstanding = q + a if active is not None else q
+            except (TypeError, ValueError):
+                outstanding = 0
+        tracks = dict(self._store.get_pool_tracks(run_id))
+        entry: dict[str, Any] = {
+            "label": key,
+            "queued": queued,
+            "outstanding": outstanding,
+        }
+        if active is not None:
+            entry["active"] = active
+        if payload.get("max_workers") is not None:
+            entry["max_workers"] = payload.get("max_workers")
+        tracks[key] = entry
+        self._store.update_run_fields(run_id, {"pool_tracks": tracks})
 
     def _merge_progress_track(self, run_id: str, payload: dict[str, Any]) -> None:
         """Merge an iterate_progress or labeled progress update into progress_tracks."""
