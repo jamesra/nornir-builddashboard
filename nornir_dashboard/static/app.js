@@ -4,6 +4,10 @@
 const LOG_DOM_MAX = 5000;
 /** Events fetched per history page (API clamps to 5000). */
 const LOG_PAGE_SIZE = 2000;
+/** Paint at most this many live log lines per flush; beyond that, catch up via API. */
+const LIVE_PAINT_MAX = 200;
+/** Remaining buffered WS items that force catch-up mode instead of per-line paint. */
+const LIVE_BACKLOG_SKIP = 400;
 
 const state = {
   runs: new Map(),       // run_id -> summary
@@ -21,6 +25,7 @@ const state = {
   logNewestFirst: true,
   /** Last header snapshot string for the selected run; skip DOM rebuild when unchanged. */
   lastHeaderSnapshot: null,
+  showPools: true,
 };
 
 const el = (id) => document.getElementById(id);
@@ -166,44 +171,49 @@ function upsertRun(run) {
   state.runs.set(run.run_id, run);
 }
 
-let _rlPending = false;
-
-function requestRenderRunList() {
-  if (_rlPending) return;
-  _rlPending = true;
-  requestAnimationFrame(() => {
-    _rlPending = false;
-    renderRunList();
-  });
-}
-
-function renderRunList() {
-  const ul = el("runs");
+function filteredSortedRuns() {
   const filter = state.runFilter.toLowerCase();
-  const runs = Array.from(state.runs.values()).sort(compareRuns);
-
-  ul.innerHTML = "";
-  for (const run of runs) {
+  const runs = [];
+  for (const run of Array.from(state.runs.values()).sort(compareRuns)) {
     if (!run.pipeline || !String(run.pipeline).trim()) continue;
     const hay = `${run.pipeline || ""} ${run.volumepath || ""} ${run.run_id}`.toLowerCase();
     if (filter && !hay.includes(filter)) continue;
+    runs.push(run);
+  }
+  return runs;
+}
 
-    const li = document.createElement("li");
-    li.className = "run-item" + (run.run_id === state.selectedRunId ? " selected" : "");
-    li.dataset.runId = run.run_id;
-    li.onclick = () => selectRun(run.run_id);
+/** Fields shown on a sidebar card (excludes ticking runtime text). */
+function sidebarCardSnapshot(run) {
+  if (!run) return "";
+  const progress = sidebarProgressDisplay(run);
+  return JSON.stringify({
+    run_id: run.run_id || null,
+    pipeline: run.pipeline || null,
+    status: run.status || null,
+    volumepath: run.volumepath || null,
+    start_ts: run.start_ts || run.first_seen || null,
+    error_count: run.error_count || 0,
+    warning_count: run.warning_count || 0,
+    selected: run.run_id === state.selectedRunId,
+    progress_showBar: !!progress.showBar,
+    progress_pct: progress.pct || 0,
+    progress_label: progress.label || "",
+  });
+}
 
-    const status = run.status || "running";
-    const started = run.start_ts || run.first_seen;
-    const runtime = fmtDuration(runRuntimeSeconds(run));
-    const sidebarProgress = sidebarProgressDisplay(run);
-    const pct = sidebarProgress.pct || 0;
-    const progressLabel = sidebarProgress.label || "";
-    const progressBarHtml = sidebarProgress.showBar
-      ? `<div class="r-progress"><div class="r-progress-fill" style="width:${pct.toFixed(1)}%"></div></div>`
-      : "";
+function runListItemHtml(run) {
+  const status = run.status || "running";
+  const started = run.start_ts || run.first_seen;
+  const runtime = fmtDuration(runRuntimeSeconds(run));
+  const sidebarProgress = sidebarProgressDisplay(run);
+  const pct = sidebarProgress.pct || 0;
+  const progressLabel = sidebarProgress.label || "";
+  const progressBarHtml = sidebarProgress.showBar
+    ? `<div class="r-progress"><div class="r-progress-fill" style="width:${pct.toFixed(1)}%"></div></div>`
+    : "";
 
-    li.innerHTML = `
+  return `
       <div class="r-line1">
         <span class="r-pipeline">${escapeHtml(run.pipeline || "(pipeline)")}</span>
         <div class="r-line1-actions">
@@ -225,14 +235,63 @@ function renderRunList() {
       </div>
       ${progressBarHtml}
       <div class="r-progress-label">${escapeHtml(progressLabel)}</div>`;
+}
 
-    const deleteBtn = li.querySelector(".run-delete");
-    deleteBtn.addEventListener("click", (event) => {
-      event.stopPropagation();
-      void deleteRun(run);
-    });
+/** Patch an existing card in place when possible (avoids destroying the click target). */
+function updateRunListItem(li, run) {
+  const snap = sidebarCardSnapshot(run);
+  const selected = run.run_id === state.selectedRunId;
+  li.classList.toggle("selected", selected);
+  if (li.dataset.sidebarSnap === snap) {
+    return;
+  }
+  li.dataset.sidebarSnap = snap;
+  li.innerHTML = runListItemHtml(run);
+}
 
-    ul.appendChild(li);
+let _rlPending = false;
+
+function requestRenderRunList() {
+  if (_rlPending) return;
+  _rlPending = true;
+  requestAnimationFrame(() => {
+    _rlPending = false;
+    renderRunList();
+  });
+}
+
+function renderRunList() {
+  const ul = el("runs");
+  const runs = filteredSortedRuns();
+  const desiredIds = runs.map((r) => r.run_id);
+  const existing = new Map();
+  for (const li of ul.querySelectorAll(".run-item[data-run-id]")) {
+    existing.set(li.dataset.runId, li);
+  }
+
+  // Drop cards no longer in the filtered list.
+  for (const [runId, li] of existing) {
+    if (!desiredIds.includes(runId)) {
+      li.remove();
+      existing.delete(runId);
+    }
+  }
+
+  // Create/update and ensure DOM order matches sorted runs.
+  let insertBefore = ul.firstChild;
+  for (const run of runs) {
+    let li = existing.get(run.run_id);
+    if (!li) {
+      li = document.createElement("li");
+      li.className = "run-item";
+      li.dataset.runId = run.run_id;
+      existing.set(run.run_id, li);
+    }
+    updateRunListItem(li, run);
+    if (li !== insertBefore) {
+      ul.insertBefore(li, insertBefore);
+    }
+    insertBefore = li.nextSibling;
   }
 }
 
@@ -368,6 +427,72 @@ function renderProgressTracks(run) {
   }
 }
 
+function poolTracksList(run) {
+  if (!run.pool_tracks || typeof run.pool_tracks !== "object") return [];
+  return Object.entries(run.pool_tracks).map(([name, track]) => {
+    const row = (track && typeof track === "object") ? { ...track } : {};
+    if (!row.label) row.label = name;
+    row._key = name;
+    return row;
+  });
+}
+
+function renderPoolTracks(run) {
+  const section = el("d-pools-section");
+  const container = el("d-pool-tracks");
+  if (!section || !container) return;
+  container.innerHTML = "";
+
+  if (!state.showPools || isTerminalStatus(run && run.status)) {
+    section.classList.add("hidden");
+    return;
+  }
+
+  const tracks = poolTracksList(run).filter((t) => (t.outstanding || 0) > 0 || (t.queued || 0) > 0 || (t.active || 0) > 0);
+  if (!tracks.length) {
+    section.classList.add("hidden");
+    return;
+  }
+  section.classList.remove("hidden");
+
+  const maxOutstanding = Math.max(
+    1,
+    ...tracks.map((t) => Number(t.outstanding) || ((Number(t.queued) || 0) + (Number(t.active) || 0))),
+  );
+
+  const sorted = tracks.slice().sort((a, b) => String(a.label || "").localeCompare(String(b.label || "")));
+  for (const track of sorted) {
+    const queued = Number(track.queued) || 0;
+    const active = track.active == null ? null : Number(track.active) || 0;
+    const outstanding = Number(track.outstanding);
+    const total = Number.isFinite(outstanding)
+      ? outstanding
+      : queued + (active == null ? 0 : active);
+    const basePct = Math.max(0, Math.min(100, (total / maxOutstanding) * 100));
+    const activePct = (active != null && total > 0)
+      ? Math.max(0, Math.min(100, (active / total) * basePct))
+      : 0;
+    const tipParts = [`outstanding ${total}`];
+    if (track.queued != null) tipParts.push(`queued ${queued}`);
+    if (active != null) tipParts.push(`active ${active}`);
+    if (track.max_workers != null) tipParts.push(`workers ${track.max_workers}`);
+
+    const row = document.createElement("div");
+    row.className = "pool-track";
+    row.title = tipParts.join(" · ");
+    row.innerHTML =
+      `<span class="pool-track-name">${escapeHtml(track.label || track._key || "pool")}</span>` +
+      `<div class="pool-bar">` +
+      `<div class="pool-fill-base" style="width:${basePct.toFixed(1)}%"></div>` +
+      (active != null
+        ? `<div class="pool-fill-active" style="width:${activePct.toFixed(1)}%"></div>`
+        : "") +
+      `</div>` +
+      `<span class="pool-track-count">${total}</span>`;
+    container.appendChild(row);
+  }
+}
+
 function headerSnapshot(run) {
   /** Stable string of header/progress fields (excludes runtime; tickRuntimes owns that). */
   if (!run) return "";
@@ -388,6 +513,8 @@ function headerSnapshot(run) {
     progress_total: run.progress_total ?? null,
     progress_fraction: run.progress_fraction ?? null,
     progress_tracks: run.progress_tracks || {},
+    pool_tracks: run.pool_tracks || {},
+    showPools: state.showPools,
   });
 }
 
@@ -420,6 +547,7 @@ function renderHeader(run, options) {
     renderCurrentElementCard(run, false);
   }
   renderProgressTracks(run);
+  renderPoolTracks(run);
 }
 
 function looksLikeAbsPath(value) {
@@ -470,7 +598,10 @@ function renderCurrentElementCard(run, terminal) {
 }
 
 function logFilterKey(event) {
-  if (event.kind === "log") return event.level || "info";
+  if (event.kind === "log") {
+    const level = (event.level || "info").toString().trim().toLowerCase();
+    return level || "info";
+  }
   if (event.kind === "event") return "event";
   if (event.kind === "status") return "status";
   return null; // meta / progress / other are not shown in the log pane
@@ -539,6 +670,7 @@ function reverseLogOrder() {
 }
 
 function checkedTypesParam() {
+  syncLevelsFromCheckboxes();
   return Array.from(state.levels).join(",");
 }
 
@@ -557,6 +689,9 @@ function buildEventsQuery(extra) {
 }
 
 function eventMatchesActiveFilters(event) {
+  // Always trust the checkbox DOM: browsers can restore form state without
+  // firing ``change``, which would leave ``state.levels`` stale for live WS inserts.
+  syncLevelsFromCheckboxes();
   const key = logFilterKey(event);
   if (key === null) return false;
   if (!state.levels.has(key)) return false;
@@ -582,7 +717,9 @@ function createLogLine(event) {
   line.dataset.text = formatEvent(event).toLowerCase();
 
   const tag = event.level || (event.kind === "event" ? "event" : event.kind);
+  const lineNo = event.id != null ? String(event.id) : "";
   line.innerHTML =
+    `<span class="n">${escapeHtml(lineNo)}</span>` +
     `<span class="t">${fmtTime(event.ts)}</span>` +
     `<span class="k">${escapeHtml(tag || "")}</span>` +
     `<span class="m">${escapeHtml(formatEvent(event))}</span>`;
@@ -592,8 +729,22 @@ function createLogLine(event) {
 function syncLevelsFromCheckboxes() {
   /** Rebuild ``state.levels`` from the log-level checkboxes. */
   state.levels = new Set(
-    Array.from(document.querySelectorAll(".lvl:checked")).map((cb) => cb.value),
+    Array.from(document.querySelectorAll(".lvl:checked")).map((cb) =>
+      String(cb.value || "").trim().toLowerCase()
+    ).filter(Boolean),
   );
+}
+
+function enableLogLevel(level) {
+  /** Show only the matching log level: check it, uncheck the others, reload. */
+  const normalized = String(level || "").trim().toLowerCase();
+  document.querySelectorAll(".lvl").forEach((cb) => {
+    cb.checked = String(cb.value || "").trim().toLowerCase() === normalized;
+  });
+  syncLevelsFromCheckboxes();
+  pruneLogDomToActiveFilters();
+  updateDownloadLogsEnabled();
+  scheduleLogReload();
 }
 
 function pruneLogDomToActiveFilters() {
@@ -680,12 +831,44 @@ function appendLogLine(event, options) {
 
 function renderEvents(events, options) {
   const opts = options || {};
+  const log = el("log");
+  const fragment = document.createDocumentFragment();
+  const lines = [];
   for (const event of events) {
     state.lastEventId = Math.max(state.lastEventId, event.id);
     if (state.oldestEventId === 0 || event.id < state.oldestEventId) {
       state.oldestEventId = event.id;
     }
-    appendLogLine(event, opts);
+    const line = createLogLine(event);
+    if (line) lines.push(line);
+  }
+  if (!lines.length) {
+    updateJumpButtonVisibility();
+    return;
+  }
+
+  // Batch DOM inserts; newest-first live tail inserts at the top as a block.
+  if (state.logNewestFirst && !opts.atOldestEnd) {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      fragment.appendChild(lines[i]);
+    }
+    log.insertBefore(fragment, log.firstChild);
+  } else if (!state.logNewestFirst && opts.atOldestEnd) {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      fragment.appendChild(lines[i]);
+    }
+    log.insertBefore(fragment, log.firstChild);
+  } else if (state.logNewestFirst && opts.atOldestEnd) {
+    for (const line of lines) fragment.appendChild(line);
+    log.appendChild(fragment);
+  } else {
+    for (const line of lines) fragment.appendChild(line);
+    log.appendChild(fragment);
+  }
+
+  trimLogWindow(state.logTailPinned || !opts.atOldestEnd);
+  if (state.logTailPinned && !opts.atOldestEnd) {
+    log.scrollTop = state.logNewestFirst ? 0 : log.scrollHeight;
   }
   updateJumpButtonVisibility();
 }
@@ -828,6 +1011,101 @@ async function refreshRunList() {
   requestRenderRunList();
 }
 
+/** Buffered live WS events; flushed in batches bounded by a UTC receive cutoff. */
+const liveBuffer = [];
+let liveFlushScheduled = false;
+let liveCatchupNeeded = false;
+
+function scheduleLiveFlush() {
+  if (liveFlushScheduled) return;
+  liveFlushScheduled = true;
+  requestAnimationFrame(flushLiveBatch);
+}
+
+function collectLiveItem(data, latestRunById, selectedEvents) {
+  /** Fold a WS frame into run/event accumulators for the current flush. */
+  if (data.type === "event_batch") {
+    for (const run of data.runs || []) {
+      if (run && run.run_id) latestRunById.set(run.run_id, run);
+    }
+    for (const event of data.events || []) {
+      if (event && event.id > 0
+          && event.run_id === state.selectedRunId && event.id > state.lastEventId) {
+        selectedEvents.push(event);
+      }
+    }
+    return;
+  }
+  if (data.type !== "event") return;
+  if (data.run && data.run.run_id) {
+    latestRunById.set(data.run.run_id, data.run);
+  }
+  const event = data.event;
+  if (event && event.id > 0
+      && event.run_id === state.selectedRunId && event.id > state.lastEventId) {
+    selectedEvents.push(event);
+  }
+}
+
+function flushLiveBatch() {
+  liveFlushScheduled = false;
+  const cutoff = Date.now() / 1000;
+  const batch = [];
+  while (liveBuffer.length && liveBuffer[0].receivedAt <= cutoff) {
+    batch.push(liveBuffer.shift());
+  }
+  if (!batch.length) {
+    if (liveBuffer.length) scheduleLiveFlush();
+    return;
+  }
+
+  const latestRunById = new Map();
+  const selectedEvents = [];
+  for (const item of batch) {
+    collectLiveItem(item.data, latestRunById, selectedEvents);
+  }
+
+  for (const run of latestRunById.values()) {
+    upsertRun(run);
+  }
+  if (latestRunById.size) {
+    requestRenderRunList();
+  }
+
+  if (state.selectedRunId) {
+    const selectedRun = latestRunById.get(state.selectedRunId)
+      || state.runs.get(state.selectedRunId);
+    if (selectedRun) {
+      renderHeader(selectedRun);
+    }
+    if (selectedEvents.length) {
+      selectedEvents.sort((a, b) => a.id - b.id);
+      const backlogHeavy =
+        selectedEvents.length > LIVE_PAINT_MAX || liveBuffer.length > LIVE_BACKLOG_SKIP;
+      if (backlogHeavy && state.logTailPinned) {
+        // Skip painting thousands of lines; advance cursor and reload when quiet.
+        for (const event of selectedEvents) {
+          state.lastEventId = Math.max(state.lastEventId, event.id);
+        }
+        liveCatchupNeeded = true;
+      } else if (state.logTailPinned) {
+        renderEvents(selectedEvents, {});
+      } else {
+        for (const event of selectedEvents) {
+          state.lastEventId = Math.max(state.lastEventId, event.id);
+        }
+      }
+    }
+  }
+
+  if (liveBuffer.length) {
+    scheduleLiveFlush();
+  } else if (liveCatchupNeeded) {
+    liveCatchupNeeded = false;
+    reloadLogNewestPage().catch(() => {});
+  }
+}
+
 function connectWs() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -857,21 +1135,10 @@ function connectWs() {
       return;
     }
 
-    if (data.type !== "event") return;
+    if (data.type !== "event" && data.type !== "event_batch") return;
 
-    if (data.run) upsertRun(data.run);
-    requestRenderRunList();
-
-    const event = data.event;
-    if (event && event.run_id === state.selectedRunId) {
-      if (data.run) renderHeader(data.run);
-      if (event.id > state.lastEventId) {
-        state.lastEventId = event.id;
-        if (state.logTailPinned && eventMatchesActiveFilters(event)) {
-          appendLogLine(event, {});
-        }
-      }
-    }
+    liveBuffer.push({ data, receivedAt: Date.now() / 1000 });
+    scheduleLiveFlush();
   };
 }
 
@@ -920,6 +1187,25 @@ function updateDownloadLogsEnabled() {
 }
 
 async function init() {
+  const runsList = el("runs");
+  runsList.addEventListener("pointerdown", (e) => {
+    if (e.target.closest(".run-delete")) return;
+    const item = e.target.closest(".run-item");
+    if (!item) return;
+    const runId = item.dataset.runId;
+    if (runId) void selectRun(runId);
+  });
+  runsList.addEventListener("click", (e) => {
+    const btn = e.target.closest(".run-delete");
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const item = btn.closest(".run-item");
+    if (!item) return;
+    const run = state.runs.get(item.dataset.runId);
+    if (run) void deleteRun(run);
+  });
+
   el("runfilter").addEventListener("input", (e) => {
     state.runFilter = e.target.value;
     requestRenderRunList();
@@ -937,8 +1223,30 @@ async function init() {
       scheduleLogReload();
     });
   });
+  el("d-errors").addEventListener("click", () => enableLogLevel("error"));
+  el("d-warnings").addEventListener("click", () => enableLogLevel("warning"));
   syncLevelsFromCheckboxes();
   updateDownloadLogsEnabled();
+
+  const showPools = el("show-pools");
+  if (showPools) {
+    state.showPools = !!showPools.checked;
+    showPools.addEventListener("change", () => {
+      state.showPools = !!showPools.checked;
+      state.lastHeaderSnapshot = null;
+      const run = state.selectedRunId ? state.runs.get(state.selectedRunId) : null;
+      if (run) renderHeader(run, { force: true });
+    });
+  }
+
+  // Browser form restoration (and bfcache) can change checkboxes without ``change``.
+  window.addEventListener("pageshow", () => {
+    syncLevelsFromCheckboxes();
+    pruneLogDomToActiveFilters();
+    updateDownloadLogsEnabled();
+    const poolsCb = el("show-pools");
+    if (poolsCb) state.showPools = !!poolsCb.checked;
+  });
 
   const log = el("log");
   log.addEventListener("scroll", () => {

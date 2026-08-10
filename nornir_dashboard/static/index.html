@@ -37,8 +37,8 @@
                         <div><label>Volume</label><span id="d-volume">-</span></div>
                         <div><label>Compute</label><span id="d-compute">-</span></div>
                         <div><label>Host</label><span id="d-host">-</span></div>
-                        <div><label>Errors</label><span id="d-errors" class="count err">0</span></div>
-                        <div><label>Warnings</label><span id="d-warnings" class="count warn">0</span></div>
+                        <div><label>Errors</label><button type="button" id="d-errors" class="count err count-filter" title="Show only error log messages">0</button></div>
+                        <div><label>Warnings</label><button type="button" id="d-warnings" class="count warn count-filter" title="Show only warning log messages">0</button></div>
                     </div>
                 </div>
 
@@ -54,6 +54,14 @@
                 </div>
 
                 <div id="d-progress-tracks" class="progress-tracks"></div>
+
+                <div id="d-pools-section" class="pools-section">
+                    <div class="pools-head">
+                        <span class="pools-title">Pools</span>
+                        <label class="pools-toggle"><input type="checkbox" id="show-pools" checked /> show</label>
+                    </div>
+                    <div id="d-pool-tracks" class="pool-tracks"></div>
+                </div>
 
                 <div class="log-controls">
                     <label><input type="checkbox" class="lvl" value="error" checked /> errors</label>
@@ -78,6 +86,6 @@
         </section>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=logfilter2"></script>
 </body>
 </html>
