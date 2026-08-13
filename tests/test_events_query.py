@@ -126,7 +126,7 @@ class TestEventsQuery(unittest.TestCase):
 
 
 class TestMaxEventsDefault(unittest.TestCase):
-    def test_config_default_is_100000(self) -> None:
+    def test_config_default_is_unlimited(self) -> None:
         import os
         from unittest.mock import patch
 
@@ -135,7 +135,7 @@ class TestMaxEventsDefault(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("NORNIR_DASHBOARD_MAX_EVENTS", None)
             config = DashboardConfig()
-            self.assertEqual(config.max_events_per_run, 100000)
+            self.assertEqual(config.max_events_per_run, 0)
 
 
 if __name__ == "__main__":

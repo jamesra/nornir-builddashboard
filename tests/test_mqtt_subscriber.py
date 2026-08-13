@@ -342,6 +342,29 @@ class TestMqttSubscriberProjection(unittest.TestCase):
         self.assertEqual(run["progress_tracks"], {})
         self.assertIsNone(run["progress_fraction"])
 
+    def test_stale_revives_to_running_on_log(self) -> None:
+        self._publish("meta", {"pipeline": "Assemble", "status": "running"})
+        self._publish("meta", {"status": "stale"})
+        self.assertEqual(self.store.get_run("R1")["status"], "stale")
+        self._publish("log/info", {"message": "build resumed"})
+        run = self.store.get_run("R1")
+        self.assertEqual(run["status"], "running")
+        self.assertIsNone(run["end_ts"])
+
+    def test_stale_revives_to_running_on_progress(self) -> None:
+        self._publish("meta", {"pipeline": "Assemble", "status": "running"})
+        self._publish("meta", {"status": "stale"})
+        self._publish("progress", {"current": 1, "total": 10})
+        self.assertEqual(self.store.get_run("R1")["status"], "running")
+
+    def test_stale_does_not_revive_on_completed_meta(self) -> None:
+        self._publish("meta", {"pipeline": "Assemble", "status": "running"})
+        self._publish("meta", {"status": "stale"})
+        self._publish("meta", {"status": "completed", "end_ts": 42.0})
+        run = self.store.get_run("R1")
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["end_ts"], 42.0)
+
     def test_pool_load_merges_into_pool_tracks(self) -> None:
         self._publish("meta", {"pipeline": "Assemble", "status": "running"})
         self._publish("event", {
@@ -452,6 +475,40 @@ class TestListRunsHidesUnnamed(unittest.TestCase):
         self.assertEqual(named["status"], "stale")
         self.assertEqual(named["progress_tracks"], {})
         self.assertIsNone(named["progress_total"])
+
+    def test_mark_stale_zero_window_still_marks(self) -> None:
+        """``stale_after<=0`` must not disable the sweeper."""
+        now = 1_000_000.0
+        self.store.ensure_run("named", now=now - 10_000)
+        self.store.update_run_fields("named", {
+            "pipeline": "Mosaic",
+            "status": "running",
+            "last_seen": now - 10_000,
+        })
+        stale_ids, deleted_ids = self.store.mark_stale_runs(0.0, now=now)
+        self.assertEqual(stale_ids, ["named"])
+        self.assertEqual(deleted_ids, [])
+        self.assertEqual(self.store.get_run("named")["status"], "stale")
+
+
+class TestStaleConfigAlwaysOn(unittest.TestCase):
+    def test_stale_after_zero_falls_back_to_default(self) -> None:
+        import os
+        from nornir_dashboard.config import (
+            DEFAULT_STALE_AFTER_SECONDS,
+            DashboardConfig,
+        )
+
+        previous = os.environ.get("NORNIR_DASHBOARD_STALE_AFTER")
+        os.environ["NORNIR_DASHBOARD_STALE_AFTER"] = "0"
+        try:
+            config = DashboardConfig()
+            self.assertEqual(config.stale_after_seconds, DEFAULT_STALE_AFTER_SECONDS)
+        finally:
+            if previous is None:
+                os.environ.pop("NORNIR_DASHBOARD_STALE_AFTER", None)
+            else:
+                os.environ["NORNIR_DASHBOARD_STALE_AFTER"] = previous
 
 
 if __name__ == "__main__":

@@ -192,6 +192,15 @@ class MqttSubscriber:
         self._store.update_run_fields(run_id, {"last_seen": now})
 
         kind, level = self._classify(leaf)
+        # Live traffic can revive a stale row unless this payload asserts a
+        # terminal status (completed / failed / skipped / stale).
+        incoming_status = payload.get("status")
+        if incoming_status not in _TERMINAL_STATUSES:
+            existing = self._store.get_run(run_id)
+            if existing is not None and existing.get("status") == "stale":
+                self._store.update_run_fields(
+                    run_id, {"status": "running", "end_ts": None})
+
         self._project_state(run_id, kind, level, payload)
 
         persist = _should_persist_event(kind, payload)

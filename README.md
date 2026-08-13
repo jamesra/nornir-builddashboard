@@ -50,9 +50,9 @@ Publishers send to run-scoped topics:
 | `NORNIR_DASHBOARD_DB` | `./nornir-dashboard.db` | SQLite database path |
 | `NORNIR_DASHBOARD_HOST` | `0.0.0.0` | HTTP bind host |
 | `NORNIR_DASHBOARD_PORT` | `8087` | HTTP port |
-| `NORNIR_DASHBOARD_MAX_EVENTS` | `100000` | Max retained events per run in SQLite (`0` disables prune) |
-| `NORNIR_DASHBOARD_STALE_AFTER` | `600` | Seconds without traffic before a running build is shown as stale |
-| `NORNIR_DASHBOARD_STALE_SWEEP_INTERVAL` | `60` | How often (seconds) to re-check for stale runs |
+| `NORNIR_DASHBOARD_MAX_EVENTS` | `0` | Max retained events per run in SQLite (`0` = unlimited / no prune) |
+| `NORNIR_DASHBOARD_STALE_AFTER` | `600` | Seconds without traffic before a running build is shown as stale (always on; `<=0` falls back to `600`) |
+| `NORNIR_DASHBOARD_STALE_SWEEP_INTERVAL` | `60` | How often (seconds) to re-check for stale runs (`<=0` falls back to `60`) |
 | `NORNIR_DASHBOARD_RETENTION_DAYS` | `30` | Auto-delete runs with no activity for this many days (`0` disables) |
 | `NORNIR_DASHBOARD_RETENTION_SWEEP_INTERVAL` | `86400` | How often (seconds) to run the retention sweeper |
 

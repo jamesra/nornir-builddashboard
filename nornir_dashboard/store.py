@@ -107,7 +107,7 @@ class DashboardStore:
     _max_events_per_run: int
     _events_since_prune: dict[str, int]
 
-    def __init__(self, database_path: str, max_events_per_run: int = 100000) -> None:
+    def __init__(self, database_path: str, max_events_per_run: int = 0) -> None:
         if database_path != ":memory:":
             parent = os.path.dirname(os.path.abspath(database_path))
             os.makedirs(parent, exist_ok=True)
@@ -340,6 +340,9 @@ class DashboardStore:
                         ) -> tuple[list[str], list[str]]:
         """Mark quiet named runs as stale; delete unnamed quiet stubs.
 
+        Non-positive *stale_after_seconds* falls back to 600 so callers cannot
+        disable stale detection.
+
         Returns
         -------
         tuple[list[str], list[str]]
@@ -347,8 +350,9 @@ class DashboardStore:
             progress cleared when marked stale. Unnamed (null/empty pipeline)
             pulse stubs are deleted instead of listed as ``(pipeline)``.
         """
+        # Stale sweep is always-on; non-positive values fall back to the default window.
         if stale_after_seconds <= 0:
-            return ([], [])
+            stale_after_seconds = 600.0
         now = time.time() if now is None else now
         cutoff = now - stale_after_seconds
         stale_ids: list[str] = []

@@ -3,7 +3,25 @@
 Environment variables mirror the names used by ``nornir_shared.mqtt_config`` so a
 single set of variables configures both publishers and the dashboard.
 """
+import logging
 import os
+
+logger = logging.getLogger(__name__)
+
+# Stale detection is always on; ``NORNIR_DASHBOARD_STALE_AFTER<=0`` is rejected.
+DEFAULT_STALE_AFTER_SECONDS = 600.0
+DEFAULT_STALE_SWEEP_INTERVAL = 60.0
+
+
+def _positive_or_default(raw: float, default: float, env_name: str) -> float:
+    """Return *raw* when positive; otherwise log and return *default*."""
+    if raw > 0:
+        return raw
+    logger.warning(
+        "%s=%s is invalid (stale sweep cannot be disabled); using %s",
+        env_name, raw, default,
+    )
+    return default
 
 
 class DashboardConfig:
@@ -33,13 +51,19 @@ class DashboardConfig:
         self.http_host = os.environ.get("NORNIR_DASHBOARD_HOST", "0.0.0.0")
         self.http_port = int(os.environ.get("NORNIR_DASHBOARD_PORT", "8087"))
         self.max_events_per_run = int(
-            os.environ.get("NORNIR_DASHBOARD_MAX_EVENTS", "100000")
+            os.environ.get("NORNIR_DASHBOARD_MAX_EVENTS", "0")
         )
-        self.stale_after_seconds = float(
-            os.environ.get("NORNIR_DASHBOARD_STALE_AFTER", "600")
+        self.stale_after_seconds = _positive_or_default(
+            float(os.environ.get("NORNIR_DASHBOARD_STALE_AFTER",
+                                 str(DEFAULT_STALE_AFTER_SECONDS))),
+            DEFAULT_STALE_AFTER_SECONDS,
+            "NORNIR_DASHBOARD_STALE_AFTER",
         )
-        self.stale_sweep_interval = float(
-            os.environ.get("NORNIR_DASHBOARD_STALE_SWEEP_INTERVAL", "60")
+        self.stale_sweep_interval = _positive_or_default(
+            float(os.environ.get("NORNIR_DASHBOARD_STALE_SWEEP_INTERVAL",
+                                 str(DEFAULT_STALE_SWEEP_INTERVAL))),
+            DEFAULT_STALE_SWEEP_INTERVAL,
+            "NORNIR_DASHBOARD_STALE_SWEEP_INTERVAL",
         )
         self.retention_days = float(
             os.environ.get("NORNIR_DASHBOARD_RETENTION_DAYS", "30")

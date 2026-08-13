@@ -132,33 +132,40 @@ async def _retention_sweeper(store: DashboardStore, subscriber: MqttSubscriber,
 async def _stale_sweeper(store: DashboardStore, manager: ConnectionManager,
                          stale_after: float, interval: float,
                          subscriber: MqttSubscriber | None = None) -> None:
-    """Background task that marks quiet named builds as stale and deletes unnamed stubs."""
+    """Background task that marks quiet named builds as stale and deletes unnamed stubs.
+
+    Always runs; *stale_after* / *interval* are expected to be positive (config
+    clamps non-positive values). Clearing retained meta for stale named runs
+    prevents broker retain from reviving them as ``running`` on reconnect.
+    A later live MQTT message can still move the row back to ``running``.
+    """
     while True:
         try:
-            if stale_after > 0:
-                stale_ids, deleted_ids = store.mark_stale_runs(stale_after)
-                for run_id in stale_ids:
-                    run = store.get_run(run_id)
-                    if run is not None:
-                        manager.submit_from_thread({
-                            "type": "event",
-                            "event": {
-                                "id": 0,
-                                "run_id": run_id,
-                                "ts": run.get("last_seen") or 0,
-                                "kind": "meta",
-                                "level": None,
-                                "payload": {"status": "stale"},
-                            },
-                            "run": run,
-                        })
-                for run_id in deleted_ids:
-                    if subscriber is not None:
-                        subscriber.clear_retained(run_id)
+            stale_ids, deleted_ids = store.mark_stale_runs(stale_after)
+            for run_id in stale_ids:
+                if subscriber is not None:
+                    subscriber.clear_retained(run_id)
+                run = store.get_run(run_id)
+                if run is not None:
                     manager.submit_from_thread({
-                        "type": "run_deleted",
-                        "run_id": run_id,
+                        "type": "event",
+                        "event": {
+                            "id": 0,
+                            "run_id": run_id,
+                            "ts": run.get("last_seen") or 0,
+                            "kind": "meta",
+                            "level": None,
+                            "payload": {"status": "stale"},
+                        },
+                        "run": run,
                     })
+            for run_id in deleted_ids:
+                if subscriber is not None:
+                    subscriber.clear_retained(run_id)
+                manager.submit_from_thread({
+                    "type": "run_deleted",
+                    "run_id": run_id,
+                })
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Stale sweep failed: %s", exc)
         await asyncio.sleep(interval)
@@ -183,7 +190,6 @@ def create_app(config: DashboardConfig | None = None) -> FastAPI:
         manager.bind_loop(asyncio.get_running_loop())
         broadcaster_task = asyncio.create_task(manager.broadcaster())
         retention_task = None
-        stale_task = None
         if config.retention_days > 0:
             retention_task = asyncio.create_task(
                 _retention_sweeper(
@@ -192,15 +198,15 @@ def create_app(config: DashboardConfig | None = None) -> FastAPI:
                     interval=config.retention_sweep_interval,
                 )
             )
-        if config.stale_after_seconds > 0:
-            stale_task = asyncio.create_task(
-                _stale_sweeper(
-                    store, manager,
-                    stale_after=config.stale_after_seconds,
-                    interval=config.stale_sweep_interval,
-                    subscriber=subscriber,
-                )
+        # Stale sweep is always enabled (config rejects <=0).
+        stale_task = asyncio.create_task(
+            _stale_sweeper(
+                store, manager,
+                stale_after=config.stale_after_seconds,
+                interval=config.stale_sweep_interval,
+                subscriber=subscriber,
             )
+        )
         subscriber.start()
         try:
             yield
@@ -209,8 +215,7 @@ def create_app(config: DashboardConfig | None = None) -> FastAPI:
             broadcaster_task.cancel()
             if retention_task is not None:
                 retention_task.cancel()
-            if stale_task is not None:
-                stale_task.cancel()
+            stale_task.cancel()
             store.close()
 
     app = FastAPI(title="Nornir Build Dashboard", lifespan=lifespan)
