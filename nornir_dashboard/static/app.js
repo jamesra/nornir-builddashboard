@@ -98,9 +98,24 @@ function isSingleItemTrack(track) {
   return track && track.total === 1;
 }
 
+function trackItemName(track) {
+  if (!track) return "";
+  if (track.element != null && track.element !== "") return String(track.element);
+  if (track.section != null && track.section !== "") return String(track.section);
+  return "";
+}
+
+function trackSingletonDisplay(track) {
+  const title = (track && track.label) || "1 item";
+  const item = trackItemName(track);
+  if (!item) return title;
+  if (title === item || title.endsWith(` - ${item}`)) return title;
+  return `${title} - ${item}`;
+}
+
 function formatTrackStatusLabel(track, fraction) {
   if (isSingleItemTrack(track)) {
-    return track.label || "1 item";
+    return trackSingletonDisplay(track);
   }
   const pct = progressFractionToPercent(fraction);
   if (track.total != null) {
@@ -116,7 +131,7 @@ function sidebarProgressDisplay(run) {
   const tracks = progressTracksList(run);
   const singleTrack = tracks.length === 1 && isSingleItemTrack(tracks[0]) ? tracks[0] : null;
   if (singleTrack) {
-    return { showBar: false, label: singleTrack.label || "1 item" };
+    return { showBar: false, label: trackSingletonDisplay(singleTrack) };
   }
   const fraction = computeProgressFraction(run);
   const pct = progressFractionToPercent(fraction);

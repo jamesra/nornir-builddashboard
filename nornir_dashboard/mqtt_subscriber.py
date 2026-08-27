@@ -406,7 +406,12 @@ class MqttSubscriber:
         self._store.update_run_fields(run_id, {"pool_tracks": tracks})
 
     def _merge_progress_track(self, run_id: str, payload: dict[str, Any]) -> None:
-        """Merge an iterate_progress or labeled progress update into progress_tracks."""
+        """Merge an iterate_progress or labeled progress update into progress_tracks.
+
+        ``label`` is the stable track title (pipeline VariableName). ``element``
+        and ``section`` are the current item; an event that omits them keeps the
+        last values so nested iterates do not flicker on each parent restart.
+        """
         track_id = payload.get("track_id") or payload.get("label") or "progress"
         label = payload.get("label") or str(track_id)
         current = payload.get("current")
@@ -425,13 +430,29 @@ class MqttSubscriber:
                 fraction = None
 
         tracks = dict(self._store.get_progress_tracks(run_id))
-        tracks[str(track_id)] = {
+        existing = tracks.get(str(track_id))
+        if not isinstance(existing, dict):
+            existing = {}
+
+        element = payload.get("element")
+        if element is None:
+            element = existing.get("element")
+        section = payload.get("section")
+        if section is None:
+            section = existing.get("section")
+
+        entry: dict[str, Any] = {
             "label": label,
             "depth": depth,
             "current": current,
             "total": total,
             "fraction": fraction,
         }
+        if element is not None:
+            entry["element"] = element
+        if section is not None:
+            entry["section"] = section
+        tracks[str(track_id)] = entry
         self._store.update_run_fields(run_id, {"progress_tracks": tracks})
 
     def _refresh_top_level_progress(self, run_id: str) -> None:

@@ -52,7 +52,7 @@ class TestMqttSubscriberProjection(unittest.TestCase):
         self._publish("event", {
             "event": "iterate_progress",
             "track_id": "iterate:ChannelNode",
-            "label": "ChannelNode - TEM",
+            "label": "ChannelNode",
             "depth": 1,
             "current": 1,
             "total": 1,
@@ -63,11 +63,81 @@ class TestMqttSubscriberProjection(unittest.TestCase):
         self.assertIn("iterate:SectionNode", tracks)
         self.assertIn("iterate:ChannelNode", tracks)
         self.assertEqual(tracks["iterate:SectionNode"]["depth"], 0)
-        self.assertEqual(tracks["iterate:ChannelNode"]["label"], "ChannelNode - TEM")
+        self.assertEqual(tracks["iterate:ChannelNode"]["label"], "ChannelNode")
+        self.assertEqual(tracks["iterate:ChannelNode"]["element"], "TEM")
         # Top-level uses shallowest largest track
         self.assertEqual(run["progress_total"], 756)
         self.assertEqual(run["current_section"], "63")
         self.assertEqual(run["current_element"], "TEM")
+
+    def test_channel_opening_keeps_sticky_element(self) -> None:
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "iterate:ChannelNode",
+            "label": "ChannelNode",
+            "depth": 1,
+            "current": 1,
+            "total": 1,
+            "element": "TEM",
+        })
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "iterate:ChannelNode",
+            "label": "ChannelNode",
+            "depth": 1,
+            "current": 0,
+            "total": 1,
+        })
+        channel = self.store.get_run("R1")["progress_tracks"]["iterate:ChannelNode"]
+        self.assertEqual(channel["label"], "ChannelNode")
+        self.assertEqual(channel["element"], "TEM")
+        self.assertEqual(channel["current"], 0)
+        self.assertEqual(channel["total"], 1)
+
+    def test_section_opening_keeps_sticky_section(self) -> None:
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "iterate:SectionNode",
+            "label": "SectionNode",
+            "depth": 0,
+            "current": 1,
+            "total": 10,
+            "section": 63,
+        })
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "iterate:SectionNode",
+            "label": "SectionNode",
+            "depth": 0,
+            "current": 1,
+            "total": 10,
+        })
+        section = self.store.get_run("R1")["progress_tracks"]["iterate:SectionNode"]
+        self.assertEqual(section["label"], "SectionNode")
+        self.assertEqual(section["section"], 63)
+
+    def test_new_element_replaces_sticky_element(self) -> None:
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "iterate:ChannelNode",
+            "label": "ChannelNode",
+            "depth": 1,
+            "current": 1,
+            "total": 2,
+            "element": "TEM",
+        })
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "iterate:ChannelNode",
+            "label": "ChannelNode",
+            "depth": 1,
+            "current": 2,
+            "total": 2,
+            "element": "LM",
+        })
+        channel = self.store.get_run("R1")["progress_tracks"]["iterate:ChannelNode"]
+        self.assertEqual(channel["element"], "LM")
+        self.assertEqual(channel["label"], "ChannelNode")
 
     def test_iterate_progress_projects_stos_path(self) -> None:
         self._publish("event", {
@@ -134,10 +204,11 @@ class TestMqttSubscriberProjection(unittest.TestCase):
         self._publish("event", {
             "event": "iterate_progress",
             "track_id": "iterate:ChannelNode",
-            "label": "ChannelNode - TEM",
+            "label": "ChannelNode",
             "depth": 1,
             "current": 1,
             "total": 1,
+            "element": "TEM",
         })
         run = self.store.get_run("R1")
         self.assertTrue(run["progress_tracks"])
@@ -173,10 +244,11 @@ class TestMqttSubscriberProjection(unittest.TestCase):
         self._publish("event", {
             "event": "iterate_progress",
             "track_id": "iterate:ChannelNode",
-            "label": "ChannelNode - TEM",
+            "label": "ChannelNode",
             "depth": 1,
             "current": 1,
             "total": 1,
+            "element": "TEM",
         })
         self._publish("event", {
             "event": "iterate_progress_complete",
