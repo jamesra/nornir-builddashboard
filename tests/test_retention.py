@@ -3,7 +3,13 @@ import time
 import unittest
 from unittest.mock import MagicMock
 
-from nornir_dashboard.main import _delete_run_and_notify, _run_retention_sweep
+try:
+    from nornir_dashboard.main import _delete_run_and_notify, _run_retention_sweep
+except ImportError as exc:  # pragma: no cover - environment without web deps
+    raise unittest.SkipTest(
+        "fastapi is required for the dashboard app tests "
+        "(pip install -e '.[test]')") from exc
+
 from nornir_dashboard.store import DashboardStore
 
 

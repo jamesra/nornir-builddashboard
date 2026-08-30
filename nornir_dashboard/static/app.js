@@ -9,6 +9,39 @@ const LIVE_PAINT_MAX = 200;
 /** Remaining buffered WS items that force catch-up mode instead of per-line paint. */
 const LIVE_BACKLOG_SKIP = 400;
 
+/**
+ * Access token used when the server sets NORNIR_DASHBOARD_TOKEN.
+ * Accepted once as ?token=... and then kept in sessionStorage so the token does
+ * not have to stay in the address bar (or in the browser history) all session.
+ */
+const dashboardToken = (function readToken() {
+  let fromQuery = "";
+  try {
+    fromQuery = new URLSearchParams(window.location.search).get("token") || "";
+  } catch (err) {
+    fromQuery = "";
+  }
+  try {
+    if (fromQuery) {
+      window.sessionStorage.setItem("nornirDashboardToken", fromQuery);
+      return fromQuery;
+    }
+    return window.sessionStorage.getItem("nornirDashboardToken") || "";
+  } catch (err) {
+    // Private browsing modes can throw on sessionStorage access.
+    return fromQuery;
+  }
+})();
+
+function apiFetch(url, options) {
+  /** fetch() that attaches the dashboard token when one is configured. */
+  const opts = options || {};
+  if (!dashboardToken) return fetch(url, opts);
+  const headers = new Headers(opts.headers || {});
+  headers.set("X-Dashboard-Token", dashboardToken);
+  return fetch(url, Object.assign({}, opts, { headers: headers }));
+}
+
 const state = {
   runs: new Map(),       // run_id -> summary
   selectedRunId: null,
@@ -354,7 +387,7 @@ async function deleteRun(run) {
 
   const runId = run.run_id;
   try {
-    const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}`, { method: "DELETE" });
+    const resp = await apiFetch(`/api/runs/${encodeURIComponent(runId)}`, { method: "DELETE" });
     if (resp.status === 404) {
       removeRunFromUi(runId);
       return;
@@ -735,7 +768,7 @@ function createLogLine(event) {
   const lineNo = event.id != null ? String(event.id) : "";
   line.innerHTML =
     `<span class="n">${escapeHtml(lineNo)}</span>` +
-    `<span class="t">${fmtTime(event.ts)}</span>` +
+    `<span class="t">${escapeHtml(fmtTime(event.ts))}</span>` +
     `<span class="k">${escapeHtml(tag || "")}</span>` +
     `<span class="m">${escapeHtml(formatEvent(event))}</span>`;
   return line;
@@ -893,7 +926,7 @@ async function fetchEventsPage(extra) {
   if (!runId) return [];
   if (state.levels.size === 0) return [];
   const qs = buildEventsQuery(extra);
-  const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}/events?${qs}`);
+  const resp = await apiFetch(`/api/runs/${encodeURIComponent(runId)}/events?${qs}`);
   const data = await resp.json();
   return data.events || [];
 }
@@ -985,7 +1018,7 @@ async function selectRun(runId) {
   updateDownloadLogsEnabled();
   renderRunList();
 
-  const runResp = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
+  const runResp = await apiFetch(`/api/runs/${encodeURIComponent(runId)}`);
   const runData = await runResp.json();
   if (runData.run) {
     upsertRun(runData.run);
@@ -1007,7 +1040,7 @@ async function fetchMissedEventsForSelectedRun() {
     renderEvents(fresh, {});
   }
 
-  const runResp = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
+  const runResp = await apiFetch(`/api/runs/${encodeURIComponent(runId)}`);
   const runData = await runResp.json();
   if (runData.run) {
     upsertRun(runData.run);
@@ -1020,7 +1053,7 @@ async function fetchMissedEventsForSelectedRun() {
 }
 
 async function refreshRunList() {
-  const resp = await fetch("/api/runs");
+  const resp = await apiFetch("/api/runs");
   const data = await resp.json();
   for (const run of data.runs) upsertRun(run);
   requestRenderRunList();
@@ -1123,7 +1156,11 @@ function flushLiveBatch() {
 
 function connectWs() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  // WebSocket cannot carry custom headers, so the token goes in the query.
+  const wsQuery = dashboardToken
+    ? `?token=${encodeURIComponent(dashboardToken)}`
+    : "";
+  const ws = new WebSocket(`${proto}://${location.host}/ws${wsQuery}`);
 
   ws.onopen = () => {
     const c = el("connection");
@@ -1160,11 +1197,16 @@ function connectWs() {
 // -- misc -------------------------------------------------------------------
 
 function escapeHtml(value) {
+  // Single quotes are escaped too: every current interpolation happens to sit
+  // in a double-quoted attribute or a text node, but build log text is
+  // untrusted, so one single-quoted attribute added later would otherwise
+  // become an injection point.
   return String(value === null || value === undefined ? "" : value)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 async function downloadLogs() {
@@ -1179,7 +1221,7 @@ async function downloadLogs() {
   const url = `/api/runs/${encodeURIComponent(runId)}/events/export${qs ? `?${qs}` : ""}`;
   const filename = `nornir-run-${runId}.log`;
   try {
-    const resp = await fetch(url);
+    const resp = await apiFetch(url);
     if (!resp.ok) throw new Error(`export failed: ${resp.status}`);
     const blob = await resp.blob();
     const objectUrl = URL.createObjectURL(blob);

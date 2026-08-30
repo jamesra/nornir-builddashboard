@@ -48,20 +48,44 @@ Publishers send to run-scoped topics:
 | `NORNIR_MQTT_PORT` | `1883` | MQTT broker port |
 | `NORNIR_MQTT_RUN_TOPIC_ROOT` | `nornir/run` | Run topic namespace root |
 | `NORNIR_DASHBOARD_DB` | `./nornir-dashboard.db` | SQLite database path |
-| `NORNIR_DASHBOARD_HOST` | `0.0.0.0` | HTTP bind host |
+| `NORNIR_DASHBOARD_HOST` | `127.0.0.1` | HTTP bind host (the container image sets `0.0.0.0`) |
 | `NORNIR_DASHBOARD_PORT` | `8087` | HTTP port |
 | `NORNIR_DASHBOARD_MAX_EVENTS` | `0` | Max retained events per run in SQLite (`0` = unlimited / no prune) |
 | `NORNIR_DASHBOARD_STALE_AFTER` | `600` | Seconds without traffic before a running build is shown as stale (always on; `<=0` falls back to `600`) |
 | `NORNIR_DASHBOARD_STALE_SWEEP_INTERVAL` | `60` | How often (seconds) to re-check for stale runs (`<=0` falls back to `60`) |
 | `NORNIR_DASHBOARD_RETENTION_DAYS` | `30` | Auto-delete runs with no activity for this many days (`0` disables) |
-| `NORNIR_DASHBOARD_RETENTION_SWEEP_INTERVAL` | `86400` | How often (seconds) to run the retention sweeper |
+| `NORNIR_DASHBOARD_RETENTION_SWEEP_INTERVAL` | `86400` | How often (seconds) to run the retention sweeper (`<=0` falls back to `86400`) |
+| `NORNIR_DASHBOARD_TOKEN` | *(unset)* | When set, every `/api/*` request and the WebSocket must present this token |
+| `NORNIR_DASHBOARD_ALLOW_DELETE` | `1` | Set to `0` to refuse `DELETE /api/runs/{run_id}` |
+
+Malformed numeric values log a warning and fall back to the default rather than
+aborting startup.
+
+### Access control
+
+The dashboard binds to loopback by default and has no user accounts. Exposing it
+on a network interface means exposing run history — and, unless deletion is
+disabled, the ability to destroy it — so when `NORNIR_DASHBOARD_HOST` is not
+loopback, set `NORNIR_DASHBOARD_TOKEN` (the app logs a warning if you do not).
+
+Clients may present the token as `Authorization: Bearer <token>`, as an
+`X-Dashboard-Token` header, or as a `?token=` query parameter. Open the UI once
+as `http://host:8087/?token=<token>`; the page stores it in `sessionStorage` and
+attaches it to subsequent API and WebSocket calls. `/`, `/static/*`, and
+`/api/health` are not gated, so the page can load and container health probes
+work without a token.
+
+`GET /api/health` returns `{"ok": true, "clients": N}` and is what the image's
+`HEALTHCHECK` polls.
 
 ### Log history API and UI
 
 - `GET /api/runs/{run_id}/events` returns a page of events (default newest page).
   Query params: `limit` (max 5000), `after_id`, `before_id` (load older),
   `q` (case-insensitive substring of the stored JSON payload), and `types`
-  (comma-separated: `error`, `warning`, `info`, `debug`, `event`, `status`).
+  (comma-separated: `error`, `warning`, `info`, `debug`, `event`, `status`,
+  `other`; `other` covers events whose topic leaf did not map to a known kind).
+  A `types` value containing no recognized key falls back to all kinds.
   `q` and `types` combine with AND; pagination applies to the filtered set.
   Omit `types` for all kinds (raw API); the UI always sends the checked set.
 - `GET /api/runs/{run_id}/events/export` streams the retained transcript as
@@ -78,6 +102,24 @@ pip install .
 NORNIR_MQTT_HOST=127.0.0.1 nornir-dashboard
 # open http://localhost:8087
 ```
+
+## Tests
+
+```bash
+pip install -e '.[test]'   # fastapi/uvicorn plus httpx for fastapi.testclient
+python -m pytest tests
+```
+
+The app-level tests skip themselves (rather than failing collection) when
+`fastapi` or `httpx` is missing.
+
+## Logging
+
+The dashboard logs to stdout via `logging.basicConfig` so Docker captures it. If
+`NORNIR_LOG_ROOT` is set **and** `nornir_shared` is importable — that is, when
+running from a monorepo working copy rather than the standalone image — it hands
+logging to `nornir_shared.misc.SetupLogging` so the run joins the unified Nornir
+log session instead of this package inventing its own file paths.
 
 ## Running with Docker
 

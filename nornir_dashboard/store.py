@@ -9,18 +9,41 @@ Two tables are maintained:
   reconstruct history for runs that completed before the browser connected.
 
 A single connection is shared across the MQTT subscriber thread and the
-FastAPI request handlers, guarded by a lock (SQLite connections are not safe
-for concurrent use from multiple threads).
+FastAPI request handlers, guarded by a re-entrant lock (SQLite connections are
+not safe for concurrent use from multiple threads). Callers that need several
+writes to land together — or a read-modify-write to be atomic against the
+sweepers — wrap them in :meth:`DashboardStore.transaction`, which collapses
+them into one commit.
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
 import sqlite3
 import threading
 import time
 from collections.abc import Iterator
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class _ClearSentinel:
+    """Marker requesting an explicit SQL NULL, as opposed to "field not supplied"."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "CLEAR"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+# Callers project MQTT payloads with ``payload.get(...)``, so a bare ``None``
+# has to keep meaning "absent, leave the column alone". CLEAR is the opt-in way
+# to say "write NULL" (for example clearing end_ts when a stale run revives).
+CLEAR = _ClearSentinel()
 
 
 _RUN_COLUMNS = (
@@ -39,10 +62,20 @@ _ADDED_COLUMNS = (
 )
 
 # Matches UI .lvl checkbox values in static/index.html / app.js logFilterKey().
-LOG_FILTER_TYPES = frozenset({"error", "warning", "info", "debug", "event", "status"})
+# "other" covers persisted rows whose topic leaf did not map to a known kind;
+# without it those rows are stored but unreachable through every filtered view.
+LOG_FILTER_TYPES = frozenset(
+    {"error", "warning", "info", "debug", "event", "status", "other"})
+
+# Kinds that the explicit filter keys above already account for. Anything else
+# that reaches the events table is reported under "other".
+_KNOWN_EVENT_KINDS = ("log", "event", "status")
 
 EVENTS_LIMIT_MAX = 5000
 EVENTS_LIMIT_DEFAULT = 2000
+
+RUNS_LIMIT_MAX = 1000
+RUNS_LIMIT_DEFAULT = 200
 
 
 def clamp_events_limit(limit: int) -> int:
@@ -54,8 +87,30 @@ def clamp_events_limit(limit: int) -> int:
     return limit
 
 
+def clamp_runs_limit(limit: int) -> int:
+    """Clamp a run-list page size to a safe range.
+
+    SQLite treats ``LIMIT -1`` as unlimited, so an unvalidated negative limit
+    dumped the whole runs table.
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return RUNS_LIMIT_DEFAULT
+    if limit < 1:
+        return 1
+    if limit > RUNS_LIMIT_MAX:
+        return RUNS_LIMIT_MAX
+    return limit
+
+
 def parse_types_param(types: str | list[str] | None) -> list[str] | None:
-    """Parse a comma-separated types query into known filter keys, or None for all."""
+    """Parse a comma-separated types query into known filter keys, or None for all.
+
+    A request whose keys are *all* unrecognized falls back to "all types". A
+    renamed or typo'd UI filter key should degrade to showing too much rather
+    than to a silently empty log view.
+    """
     if types is None:
         return None
     if isinstance(types, str):
@@ -64,7 +119,12 @@ def parse_types_param(types: str | list[str] | None) -> list[str] | None:
         raw = [str(part).strip().lower() for part in types if str(part).strip()]
     if not raw:
         return None
-    return [t for t in raw if t in LOG_FILTER_TYPES]
+    known = [t for t in raw if t in LOG_FILTER_TYPES]
+    if not known:
+        logger.warning(
+            "No recognized event types in %r; returning all types", raw)
+        return None
+    return known
 
 
 def _types_sql(types: list[str] | None) -> tuple[str, list[Any]]:
@@ -90,6 +150,11 @@ def _types_sql(types: list[str] | None) -> tuple[str, list[Any]]:
             parts.append("kind = 'event'")
         elif t == "status":
             parts.append("kind = 'status'")
+        elif t == "other":
+            placeholders = ",".join("?" * len(_KNOWN_EVENT_KINDS))
+            parts.append(
+                f"(kind IS NULL OR kind NOT IN ({placeholders}))")
+            params.extend(_KNOWN_EVENT_KINDS)
     if not parts:
         return "0=1", []
     return "(" + " OR ".join(parts) + ")", params
@@ -103,9 +168,10 @@ class DashboardStore:
     _PRUNE_EVERY: int = 1000
 
     _connection: sqlite3.Connection
-    _lock: threading.Lock
+    _lock: threading.RLock
     _max_events_per_run: int
     _events_since_prune: dict[str, int]
+    _transaction_depth: int
 
     def __init__(self, database_path: str, max_events_per_run: int = 0) -> None:
         if database_path != ":memory:":
@@ -114,10 +180,58 @@ class DashboardStore:
 
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
-        self._lock = threading.Lock()
+        # Re-entrant so a caller can hold an explicit transaction() across
+        # several store calls, each of which takes the lock again.
+        self._lock = threading.RLock()
         self._max_events_per_run = max_events_per_run
         self._events_since_prune = {}
+        self._transaction_depth = 0
+        self._configure_connection()
         self._initialize_schema()
+
+    def _configure_connection(self) -> None:
+        """Apply the write-throughput pragmas.
+
+        At SQLite defaults every commit is an fsync against a rollback journal,
+        which is the dominant cost of ingesting a log flood: WAL plus
+        ``synchronous=NORMAL`` trades "durable across an OS crash" for "durable
+        across a process crash", which is the right trade for a telemetry
+        mirror whose source of truth is the build itself.
+        """
+        with self._lock:
+            try:
+                self._connection.execute("PRAGMA journal_mode=WAL")
+                self._connection.execute("PRAGMA synchronous=NORMAL")
+            except sqlite3.DatabaseError as exc:  # pragma: no cover - platform dependent
+                logger.warning(
+                    "Could not enable WAL/synchronous=NORMAL on %s: %s",
+                    getattr(self._connection, "name", "sqlite"), exc)
+
+    def _commit(self) -> None:
+        """Commit, unless an enclosing :meth:`transaction` owns the commit."""
+        if self._transaction_depth == 0:
+            self._connection.commit()
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Batch every store write inside the block into a single commit.
+
+        Also makes read-modify-write sequences (the ``progress_tracks`` blob
+        merge in particular) atomic against other writers, since the store lock
+        is held for the whole block.
+        """
+        with self._lock:
+            self._transaction_depth += 1
+            try:
+                yield
+            except BaseException:
+                self._transaction_depth -= 1
+                if self._transaction_depth == 0:
+                    self._connection.rollback()
+                raise
+            self._transaction_depth -= 1
+            if self._transaction_depth == 0:
+                self._connection.commit()
 
     def _initialize_schema(self) -> None:
         """Create tables and indexes when they do not already exist."""
@@ -158,6 +272,13 @@ class DashboardStore:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
+
+                -- Both sweeps filter on the COALESCE activity expression, so the
+                -- indexes have to be on that expression rather than the columns.
+                CREATE INDEX IF NOT EXISTS idx_runs_activity
+                    ON runs(COALESCE(last_seen, first_seen, 0));
+                CREATE INDEX IF NOT EXISTS idx_runs_status_activity
+                    ON runs(status, COALESCE(last_seen, first_seen, 0));
                 """
             )
             existing = {
@@ -187,16 +308,24 @@ class DashboardStore:
                 """,
                 (run_id, now, now),
             )
-            self._connection.commit()
+            self._commit()
 
-    def update_run_fields(self, run_id: str, fields: dict[str, Any]) -> None:
-        """Update the given summary columns for a run, ignoring unknown keys."""
-        updates = {
-            k: v for k, v in fields.items()
-            if k in _RUN_COLUMNS and k != "run_id" and v is not None
-        }
+    def update_run_fields(self, run_id: str, fields: dict[str, Any]) -> bool:
+        """Update the given summary columns for a run, ignoring unknown keys.
+
+        ``None`` means "not supplied, leave the column alone"; pass :data:`CLEAR`
+        to write SQL NULL. Returns False when no row matched, which happens when
+        a sweeper deleted the run while this projection was in flight.
+        """
+        updates: dict[str, Any] = {}
+        for key, value in fields.items():
+            if key not in _RUN_COLUMNS or key == "run_id":
+                continue
+            if value is None:
+                continue
+            updates[key] = None if isinstance(value, _ClearSentinel) else value
         if not updates:
-            return
+            return True
 
         if "progress_tracks" in updates and not isinstance(updates["progress_tracks"], str):
             updates["progress_tracks"] = json.dumps(updates["progress_tracks"], default=str)
@@ -207,21 +336,35 @@ class DashboardStore:
         values = list(updates.values())
         values.append(run_id)
         with self._lock:
-            self._connection.execute(
+            cursor = self._connection.execute(
                 f"UPDATE runs SET {assignments} WHERE run_id=?", values
             )
-            self._connection.commit()
+            self._commit()
+            if cursor.rowcount == 0:
+                logger.warning(
+                    "Discarded update for unknown run %s (columns: %s)",
+                    run_id, ", ".join(sorted(updates)))
+                return False
+        return True
 
-    def increment_counter(self, run_id: str, column: str) -> None:
-        """Atomically increment ``error_count`` or ``warning_count`` for a run."""
+    def increment_counter(self, run_id: str, column: str) -> bool:
+        """Atomically increment ``error_count`` or ``warning_count`` for a run.
+
+        Returns False when no row matched (unknown or already-deleted run).
+        """
         if column not in ("error_count", "warning_count"):
-            return
+            return False
         with self._lock:
-            self._connection.execute(
+            cursor = self._connection.execute(
                 f"UPDATE runs SET {column}=COALESCE({column},0)+1 WHERE run_id=?",
                 (run_id,),
             )
-            self._connection.commit()
+            self._commit()
+            if cursor.rowcount == 0:
+                logger.warning(
+                    "Discarded %s increment for unknown run %s", column, run_id)
+                return False
+        return True
 
     @staticmethod
     def _decode_run_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -274,6 +417,21 @@ class DashboardStore:
             ).fetchone()
         return self._decode_run_row(row) if row is not None else None
 
+    def get_run_status(self, run_id: str) -> str | None:
+        """Return only a run's ``status``, or None when the run is unknown.
+
+        The per-message stale-revival check needs one column; :meth:`get_run`
+        would return 23 columns and JSON-decode both track blobs to get it.
+        """
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT status FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        status = row["status"]
+        return None if status is None else str(status)
+
     def get_progress_tracks(self, run_id: str) -> dict[str, Any]:
         """Return the progress_tracks map for a run (empty dict when unset)."""
         run = self.get_run(run_id)
@@ -307,7 +465,7 @@ class DashboardStore:
                 """,
                 (json.dumps({}), json.dumps({}), run_id),
             )
-            self._connection.commit()
+            self._commit()
 
     def delete_run(self, run_id: str) -> bool:
         """Delete a run and its events. Return True when a row was removed."""
@@ -316,7 +474,8 @@ class DashboardStore:
                 "DELETE FROM runs WHERE run_id=?", (run_id,)
             )
             self._connection.execute("DELETE FROM events WHERE run_id=?", (run_id,))
-            self._connection.commit()
+            self._commit()
+            self._events_since_prune.pop(run_id, None)
             return cursor.rowcount > 0
 
     def list_expired_run_ids(self, older_than_days: float, now: float | None = None
@@ -374,6 +533,7 @@ class DashboardStore:
                         "DELETE FROM runs WHERE run_id=?", (run_id,))
                     self._connection.execute(
                         "DELETE FROM events WHERE run_id=?", (run_id,))
+                    self._events_since_prune.pop(run_id, None)
                     deleted_ids.append(run_id)
                     continue
                 self._connection.execute(
@@ -390,7 +550,7 @@ class DashboardStore:
                     ("stale", json.dumps({}), json.dumps({}), run_id),
                 )
                 stale_ids.append(run_id)
-            self._connection.commit()
+            self._commit()
         return (stale_ids, deleted_ids)
 
     # -- event helpers ----------------------------------------------------
@@ -409,7 +569,7 @@ class DashboardStore:
                 (run_id, ts, kind, level, json.dumps(payload, default=str)),
             )
             event_id = int(cursor.lastrowid)
-            self._connection.commit()
+            self._commit()
             if self._max_events_per_run > 0:
                 count = self._events_since_prune.get(run_id, 0) + 1
                 if count >= self._PRUNE_EVERY:
@@ -575,7 +735,7 @@ class DashboardStore:
                 f"DELETE FROM events WHERE run_id=? AND id NOT IN ({placeholders})",
                 (run_id, *keep_ids),
             )
-            self._connection.commit()
+            self._commit()
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""

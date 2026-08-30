@@ -13,9 +13,17 @@ from typing import Any, Callable
 import paho.mqtt.client as mqtt
 import paho.mqtt.enums as mqtt_enum
 
-from nornir_dashboard.store import DashboardStore
+from nornir_dashboard.store import CLEAR, DashboardStore
 
 logger = logging.getLogger(__name__)
+
+# QoS 1 for retained clears: at QoS 0 a clear issued while the broker link is
+# down is dropped silently and the deleted run reappears on the next reconnect.
+_RETAINED_CLEAR_QOS = 1
+
+# Only the ``meta`` leaf is published with retain=True by
+# nornir_shared.mqtt_telemetry, so it is the only leaf a clear has to target.
+_RETAINED_LEAVES = ("meta",)
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped", "stale"})
 
@@ -27,6 +35,30 @@ _EPHEMERAL_EVENT_TYPES = frozenset({
     "iterate_progress_complete",
     "pool_load",
 })
+
+
+def _coerce_number(value: Any, default: float) -> float:
+    """Return *value* as a float, or *default* when it is missing or unparsable.
+
+    Publisher payloads are JSON from another process, so numeric fields arrive
+    as whatever the publisher put there. A single string ``depth`` used to make
+    the track sort raise ``TypeError`` and lose the whole message.
+    """
+    if value is None:
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if result != result or result in (float("inf"), float("-inf")):  # NaN / inf
+        return default
+    return result
+
+
+def _coerce_depth(value: Any) -> int | float:
+    """Normalize a publisher-supplied track depth to a number (default 0)."""
+    depth = _coerce_number(value, 0.0)
+    return int(depth) if depth.is_integer() else depth
 
 
 def _is_chain_progress_track(track_id: str) -> bool:
@@ -95,13 +127,15 @@ class MqttSubscriber:
             if self._started:
                 return
             self._started = True
-
-        self._connect_thread = threading.Thread(
-            target=self._connect_with_retry,
-            name="dashboard-mqtt-connect",
-            daemon=True,
-        )
-        self._connect_thread.start()
+            # Published under the lock so a concurrent stop() cannot observe
+            # _started=True with no thread to join.
+            self._connect_thread = threading.Thread(
+                target=self._connect_with_retry,
+                name="dashboard-mqtt-connect",
+                daemon=True,
+            )
+            thread = self._connect_thread
+        thread.start()
 
     def _connect_with_retry(self) -> None:
         """Attempt MQTT connect until success or :meth:`stop` clears ``_started``."""
@@ -110,7 +144,13 @@ class MqttSubscriber:
         while self._started:
             try:
                 self._client.connect(self._host, self._port, self._keepalive)
-                self._client.loop_start()
+                with self._lock:
+                    if not self._started:
+                        # stop() ran during connect(); do not start a network
+                        # thread that nothing will ever shut down.
+                        self._client.disconnect()
+                        return
+                    self._client.loop_start()
                 logger.info(
                     "Dashboard subscriber connecting to %s:%s (topic root %s)",
                     self._host, self._port, self._topic_root)
@@ -125,26 +165,56 @@ class MqttSubscriber:
                     return
                 delay = min(delay * 2.0, max_delay)
 
-    def stop(self) -> None:
-        """Stop the network loop and disconnect from the broker."""
+    def stop(self, join_timeout: float = 5.0) -> None:
+        """Stop the network loop and disconnect from the broker.
+
+        Joins the connect thread so a connect already in flight cannot start a
+        paho network thread after shutdown has run.
+        """
         with self._lock:
             self._started = False
+            thread = self._connect_thread
         self._stop_event.set()
+
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=join_timeout)
+            if thread.is_alive():  # pragma: no cover - blocked in connect()
+                logger.warning(
+                    "MQTT connect thread did not exit within %.0fs; "
+                    "continuing shutdown", join_timeout)
+
         try:
             self._client.loop_stop()
             self._client.disconnect()
         except Exception:  # pragma: no cover - best effort shutdown
             pass
 
-    def clear_retained(self, run_id: str) -> None:
-        """Clear retained meta for a deleted run by publishing an empty retained payload."""
+    def clear_retained(self, run_id: str) -> bool:
+        """Clear retained state for a deleted run; return True when published.
+
+        Publishes at QoS 1 and checks the result: a dropped clear resurrects the
+        deleted run as ``running`` from broker retain on the next reconnect.
+        """
         if not run_id:
-            return
-        topic = f"{self._topic_root}/{run_id}/meta"
-        try:
-            self._client.publish(topic, payload=b"", retain=True)
-        except Exception as exc:  # pragma: no cover - network dependent
-            logger.warning("Failed to clear retained meta for %s: %s", run_id, exc)
+            return False
+        published = True
+        for leaf in _RETAINED_LEAVES:
+            topic = f"{self._topic_root}/{run_id}/{leaf}"
+            try:
+                info = self._client.publish(
+                    topic, payload=b"", qos=_RETAINED_CLEAR_QOS, retain=True)
+            except Exception as exc:  # pragma: no cover - network dependent
+                logger.warning("Failed to clear retained %s for %s: %s",
+                               leaf, run_id, exc)
+                published = False
+                continue
+            rc = getattr(info, "rc", mqtt.MQTT_ERR_SUCCESS)
+            if rc != mqtt.MQTT_ERR_SUCCESS:
+                logger.warning(
+                    "Retained clear for %s was not accepted by the broker "
+                    "(rc=%s); the run may reappear after reconnect", topic, rc)
+                published = False
+        return published
 
     def _on_connect(self, client: mqtt.Client, userdata: Any, flags: Any,
                     reason_code: Any, properties: Any = None) -> None:
@@ -186,31 +256,39 @@ class MqttSubscriber:
             payload = {"message": payload}
 
         now = time.time()
-        ts = float(payload.get("ts") or payload.get("timestamp") or now)
-
-        self._store.ensure_run(run_id, now=now)
-        self._store.update_run_fields(run_id, {"last_seen": now})
+        ts = self._coerce_timestamp(topic, payload, now)
 
         kind, level = self._classify(leaf)
-        # Live traffic can revive a stale row unless this payload asserts a
-        # terminal status (completed / failed / skipped / stale).
-        incoming_status = payload.get("status")
-        if incoming_status not in _TERMINAL_STATUSES:
-            existing = self._store.get_run(run_id)
-            if existing is not None and existing.get("status") == "stale":
-                self._store.update_run_fields(
-                    run_id, {"status": "running", "end_ts": None})
-
-        self._project_state(run_id, kind, level, payload)
-
-        persist = _should_persist_event(kind, payload)
-        event_id = 0
-        if persist:
-            event_id = self._store.add_event(run_id, ts, kind, level, payload)
-
         # Info/debug log floods do not change sidebar counters; skip the full
         # run summary read+broadcast payload so WS stays usable under load.
         include_run = kind != "log" or level in ("error", "warning")
+        run_summary: dict[str, Any] | None = None
+        event_id = 0
+
+        # One transaction per message: at SQLite defaults each store call was a
+        # separate fsync, and it also makes the read-modify-write track merges
+        # atomic against the sweepers running on the event loop.
+        with self._store.transaction():
+            # ensure_run's ON CONFLICT already writes last_seen, so no separate
+            # last_seen UPDATE is needed here.
+            self._store.ensure_run(run_id, now=now)
+
+            # Live traffic can revive a stale row unless this payload asserts a
+            # terminal status (completed / failed / skipped / stale).
+            incoming_status = payload.get("status")
+            if incoming_status not in _TERMINAL_STATUSES:
+                if self._store.get_run_status(run_id) == "stale":
+                    self._store.update_run_fields(
+                        run_id, {"status": "running", "end_ts": CLEAR})
+
+            self._project_state(run_id, kind, level, payload)
+
+            if _should_persist_event(kind, payload):
+                event_id = self._store.add_event(run_id, ts, kind, level, payload)
+
+            if include_run:
+                run_summary = self._store.get_run(run_id)
+
         message: dict[str, Any] = {
             "type": "event",
             "event": {
@@ -223,8 +301,28 @@ class MqttSubscriber:
             },
         }
         if include_run:
-            message["run"] = self._store.get_run(run_id)
+            message["run"] = run_summary
         self._broadcast(message)
+
+    @staticmethod
+    def _coerce_timestamp(topic: str, payload: dict[str, Any], now: float) -> float:
+        """Return the payload timestamp, falling back to *now* on bad input.
+
+        A malformed ``ts`` must not discard the message: this used to raise
+        before any store write, so an error line with a bad timestamp vanished
+        from both the log pane and the sidebar counter.
+        """
+        for key in ("ts", "timestamp"):
+            raw = payload.get(key)
+            if not raw:
+                continue
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring unparsable %s=%r on %s; using arrival time",
+                    key, raw, topic)
+        return now
 
     def _parse_topic(self, topic: str) -> tuple[str | None, str | None]:
         """Split a topic into ``(run_id, leaf)`` relative to the topic root."""
@@ -354,6 +452,16 @@ class MqttSubscriber:
                 fields["current_section"] = str(payload.get("section"))
             if payload.get("path") is not None:
                 fields["current_path"] = payload.get("path")
+            if event_type == "stage_failed":
+                # PipelineManager raises PipelineError right after publishing
+                # this, so the run really is over; without a status write the
+                # sidebar kept rendering it as running until unrelated meta
+                # happened to arrive. error_count is deliberately not touched:
+                # the same failure is also published as a log/error line, which
+                # already increments the counter.
+                fields["status"] = "failed"
+                if payload.get("end_ts") is not None:
+                    fields["end_ts"] = payload.get("end_ts")
 
         if event_type == "iterate_progress":
             if payload.get("section") is not None:
@@ -362,9 +470,9 @@ class MqttSubscriber:
                 fields["current_element"] = payload.get("element")
             if payload.get("path") is not None:
                 fields["current_path"] = payload.get("path")
-            self._merge_progress_track(run_id, payload)
+            merged = self._merge_progress_track(run_id, payload)
             # Refresh top-level progress from shallowest largest track after merge.
-            self._refresh_top_level_progress(run_id)
+            self._refresh_top_level_progress(run_id, tracks=merged)
 
         if event_type == "iterate_progress_complete":
             # Keep the last track snapshot sticky until current_stage changes
@@ -405,8 +513,12 @@ class MqttSubscriber:
         tracks[key] = entry
         self._store.update_run_fields(run_id, {"pool_tracks": tracks})
 
-    def _merge_progress_track(self, run_id: str, payload: dict[str, Any]) -> None:
+    def _merge_progress_track(self, run_id: str,
+                              payload: dict[str, Any]) -> dict[str, Any]:
         """Merge an iterate_progress or labeled progress update into progress_tracks.
+
+        Returns the merged track map so the caller can refresh top-level
+        progress without re-reading and re-decoding the blob.
 
         ``label`` is the stable track title (pipeline VariableName). ``element``
         and ``section`` are the current item; an event that omits them keeps the
@@ -418,9 +530,7 @@ class MqttSubscriber:
         if current is None:
             current = payload.get("progress")
         total = payload.get("total")
-        depth = payload.get("depth")
-        if depth is None:
-            depth = 0
+        depth = _coerce_depth(payload.get("depth"))
 
         fraction = payload.get("fraction")
         if fraction is None and current is not None and total:
@@ -454,23 +564,28 @@ class MqttSubscriber:
             entry["section"] = section
         tracks[str(track_id)] = entry
         self._store.update_run_fields(run_id, {"progress_tracks": tracks})
+        return tracks
 
-    def _refresh_top_level_progress(self, run_id: str) -> None:
-        """Set sidebar progress from the shallowest active track with the largest total."""
-        tracks = self._store.get_progress_tracks(run_id)
+    def _refresh_top_level_progress(self, run_id: str,
+                                    tracks: dict[str, Any] | None = None) -> None:
+        """Set sidebar progress from the shallowest active track with the largest total.
+
+        Callers that just merged a track pass the merged map in *tracks* to
+        avoid decoding the blob a second time.
+        """
+        if tracks is None:
+            tracks = self._store.get_progress_tracks(run_id)
         if not tracks:
             self._store.clear_run_progress(run_id)
             return
 
         def sort_key(item: tuple[str, Any]) -> tuple:
             track = item[1] if isinstance(item[1], dict) else {}
-            depth = track.get("depth", 999)
-            total = track.get("total") or 0
-            try:
-                total_val = float(total)
-            except (TypeError, ValueError):
-                total_val = 0.0
-            return (depth, -total_val)
+            # Both keys are publisher-supplied and may be strings; comparing a
+            # str depth against an int depth would raise mid-projection.
+            depth_val = _coerce_number(track.get("depth"), 999.0)
+            total_val = _coerce_number(track.get("total"), 0.0)
+            return (depth_val, -total_val)
 
         ordered = sorted(tracks.items(), key=sort_key)
         best = ordered[0][1] if ordered else None
@@ -494,6 +609,7 @@ class MqttSubscriber:
 
     def _update_progress(self, run_id: str, payload: dict[str, Any]) -> None:
         """Update progress columns from a CurseProgress-style payload."""
+        merged_tracks: dict[str, Any] | None = None
         if payload.get("label"):
             # Operation-level labeled progress joins the nested track stack.
             labeled = dict(payload)
@@ -503,7 +619,7 @@ class MqttSubscriber:
                 labeled["depth"] = 100  # deeper than iterate tracks by default
             if "current" not in labeled and payload.get("progress") is not None:
                 labeled["current"] = payload.get("progress")
-            self._merge_progress_track(run_id, labeled)
+            merged_tracks = self._merge_progress_track(run_id, labeled)
 
         fields: dict[str, Any] = {}
         if payload.get("progress") is not None:
@@ -522,5 +638,5 @@ class MqttSubscriber:
 
         if fields:
             self._store.update_run_fields(run_id, fields)
-        if payload.get("label"):
-            self._refresh_top_level_progress(run_id)
+        if merged_tracks is not None:
+            self._refresh_top_level_progress(run_id, tracks=merged_tracks)

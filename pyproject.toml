@@ -29,6 +29,13 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 
+[project.optional-dependencies]
+# httpx backs fastapi.testclient; without it the app tests cannot be collected.
+test = [
+    "pytest >= 8.0",
+    "httpx >= 0.27",
+]
+
 [project.scripts]
 nornir-dashboard = "nornir_dashboard.main:run"
 

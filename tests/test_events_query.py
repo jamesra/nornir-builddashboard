@@ -26,7 +26,9 @@ class TestClampAndParse(unittest.TestCase):
         self.assertIsNone(parse_types_param(None))
         self.assertIsNone(parse_types_param(""))
         self.assertEqual(parse_types_param("error,warning"), ["error", "warning"])
-        self.assertEqual(parse_types_param("bogus"), [])
+        # An entirely unrecognized filter falls back to "all types" rather than
+        # to an empty log view (see tests/test_store_chunk11.py).
+        self.assertIsNone(parse_types_param("bogus"))
         self.assertEqual(parse_types_param(["Event", " status "]), ["event", "status"])
 
 
