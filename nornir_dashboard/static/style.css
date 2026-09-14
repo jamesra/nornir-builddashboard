@@ -168,6 +168,12 @@ button.count-filter:focus-visible {
     color: var(--text);
     font-size: 12px;
 }
+.progress-track-item {
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    color: var(--text);
+    word-break: break-all;
+}
 .progress-wrap { display: flex; align-items: center; gap: 12px; }
 .progress-bar { flex: 1; height: 14px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .progress-fill { height: 100%; width: 0%; background: var(--accent); transition: width 0.3s ease; }

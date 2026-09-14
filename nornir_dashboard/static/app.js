@@ -131,6 +131,17 @@ function isSingleItemTrack(track) {
   return track && track.total === 1;
 }
 
+function isIndeterminateTrack(track) {
+  if (!track || isSingleItemTrack(track)) return false;
+  if (track.total != null && track.total !== undefined) return false;
+  if (track.fraction != null && track.fraction !== undefined) return false;
+  return true;
+}
+
+function trackHidesProgressBar(track) {
+  return isSingleItemTrack(track) || isIndeterminateTrack(track);
+}
+
 function trackItemName(track) {
   if (!track) return "";
   if (track.element != null && track.element !== "") return String(track.element);
@@ -160,11 +171,33 @@ function formatTrackStatusLabel(track, fraction) {
   return "-";
 }
 
+/** Labeled name-only track (no bar): group title + current element/section. */
+function namedProgressTrackHtml(track) {
+  const groupLabel = (track && track.label) || "progress";
+  const item = trackItemName(track);
+  if (item) {
+    return (
+      `<div class="progress-track-label">${escapeHtml(groupLabel)}</div>` +
+      `<div class="progress-track-item">${escapeHtml(item)}</div>`
+    );
+  }
+  return `<div class="progress-track-label progress-track-single">${escapeHtml(groupLabel)}</div>`;
+}
+
 function sidebarProgressDisplay(run) {
   const tracks = progressTracksList(run);
   const singleTrack = tracks.length === 1 && isSingleItemTrack(tracks[0]) ? tracks[0] : null;
   if (singleTrack) {
     return { showBar: false, label: trackSingletonDisplay(singleTrack) };
+  }
+  const onlyIndeterminate =
+    tracks.length === 1 && isIndeterminateTrack(tracks[0]) ? tracks[0] : null;
+  if (onlyIndeterminate) {
+    const item = trackItemName(onlyIndeterminate);
+    return {
+      showBar: false,
+      label: item || onlyIndeterminate.label || "in progress",
+    };
   }
   const fraction = computeProgressFraction(run);
   const pct = progressFractionToPercent(fraction);
@@ -429,6 +462,8 @@ function renderProgressTracks(run) {
       total: run.progress_total,
       current: run.progress_current,
       fraction,
+      element: run.current_element,
+      section: run.current_section,
     };
     if (run.progress_total === 1) {
       fallbackTrack.label = run.current_element || run.current_section || "1 item";
@@ -436,8 +471,8 @@ function renderProgressTracks(run) {
     const label = formatTrackStatusLabel(fallbackTrack, fraction);
     const track = document.createElement("div");
     track.className = "progress-track";
-    if (isSingleItemTrack(fallbackTrack)) {
-      track.innerHTML = `<div class="progress-track-label progress-track-single">${escapeHtml(label)}</div>`;
+    if (trackHidesProgressBar(fallbackTrack)) {
+      track.innerHTML = namedProgressTrackHtml(fallbackTrack);
     } else {
       track.innerHTML =
         `<div class="progress-track-label">Progress</div>` +
@@ -462,8 +497,8 @@ function renderProgressTracks(run) {
 
     const row = document.createElement("div");
     row.className = "progress-track";
-    if (isSingleItemTrack(track)) {
-      row.innerHTML = `<div class="progress-track-label progress-track-single">${escapeHtml(label)}</div>`;
+    if (trackHidesProgressBar(track)) {
+      row.innerHTML = namedProgressTrackHtml(track);
     } else {
       row.innerHTML =
         `<div class="progress-track-label">${escapeHtml(title)}</div>` +
