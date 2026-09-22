@@ -25,7 +25,7 @@ _RETAINED_CLEAR_QOS = 1
 # nornir_shared.mqtt_telemetry, so it is the only leaf a clear has to target.
 _RETAINED_LEAVES = ("meta",)
 
-_TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped", "stale"})
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped", "stopped", "stale"})
 
 # High-churn telemetry: project into run summary + live WS, but do not append to
 # the SQLite transcript. Otherwise iterate_progress floods prune away real errors.
@@ -274,7 +274,7 @@ class MqttSubscriber:
             self._store.ensure_run(run_id, now=now)
 
             # Live traffic can revive a stale row unless this payload asserts a
-            # terminal status (completed / failed / skipped / stale).
+            # terminal status (completed / failed / skipped / stopped / stale).
             incoming_status = payload.get("status")
             if incoming_status not in _TERMINAL_STATUSES:
                 if self._store.get_run_status(run_id) == "stale":

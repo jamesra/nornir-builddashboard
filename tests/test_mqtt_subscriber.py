@@ -437,6 +437,37 @@ class TestMqttSubscriberProjection(unittest.TestCase):
         self.assertEqual(run["status"], "completed")
         self.assertEqual(run["end_ts"], 42.0)
 
+    def test_stopped_meta_is_terminal_and_does_not_revive(self) -> None:
+        self._publish("meta", {"pipeline": "sam2-em-train", "status": "running"})
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "epochs",
+            "label": "epochs",
+            "depth": 0,
+            "current": 2,
+            "total": 15,
+        })
+        self._publish("meta", {"status": "stale"})
+        self._publish("meta", {"status": "stopped", "end_ts": 42.0})
+        run = self.store.get_run("R1")
+        self.assertEqual(run["status"], "stopped")
+        self.assertEqual(run["end_ts"], 42.0)
+        self.assertEqual(run["progress_tracks"], {})
+        self.assertEqual(run["pipeline"], "sam2-em-train")
+
+        self._publish("log/info", {"message": "late line"})
+        self._publish("event", {
+            "event": "iterate_progress",
+            "track_id": "epochs",
+            "label": "epochs",
+            "current": 3,
+            "total": 15,
+            "depth": 0,
+        })
+        run = self.store.get_run("R1")
+        self.assertEqual(run["status"], "stopped")
+        self.assertEqual(run["end_ts"], 42.0)
+
     def test_pool_load_merges_into_pool_tracks(self) -> None:
         self._publish("meta", {"pipeline": "Assemble", "status": "running"})
         self._publish("event", {

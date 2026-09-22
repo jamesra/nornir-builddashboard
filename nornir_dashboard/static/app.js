@@ -8,6 +8,8 @@ const LOG_PAGE_SIZE = 2000;
 const LIVE_PAINT_MAX = 200;
 /** Remaining buffered WS items that force catch-up mode instead of per-line paint. */
 const LIVE_BACKLOG_SKIP = 400;
+/** Run statuses that are finished: they sort below active runs and do not revive. */
+const TERMINAL_STATUSES = ["completed", "failed", "skipped", "stopped", "stale"];
 
 /**
  * Access token used when the server sets NORNIR_DASHBOARD_TOKEN.
@@ -93,7 +95,7 @@ function runRuntimeSeconds(run) {
   if (!run) return null;
   const start = run.start_ts || run.first_seen;
   if (!start) return null;
-  const end = run.end_ts || (["completed", "failed", "skipped", "stale"].includes(run.status)
+  const end = run.end_ts || (TERMINAL_STATUSES.includes(run.status)
     ? run.last_seen
     : (Date.now() / 1000));
   return end - start;
@@ -104,6 +106,7 @@ function statusClass(status) {
     case "completed": return "completed";
     case "failed": return "failed";
     case "skipped": return "skipped";
+    case "stopped": return "stopped";
     case "stale": return "stale";
     default: return "running";
   }
@@ -223,7 +226,7 @@ function formatCompute(compute) {
 // -- run list ---------------------------------------------------------------
 
 function isActiveRun(run) {
-  return !["completed", "failed", "skipped", "stale"].includes(run.status || "running");
+  return !TERMINAL_STATUSES.includes(run.status || "running");
 }
 
 function runStartTs(run) {
@@ -440,7 +443,7 @@ async function deleteRun(run) {
 // -- detail -----------------------------------------------------------------
 
 function isTerminalStatus(status) {
-  return ["completed", "failed", "skipped", "stale"].includes(status || "");
+  return TERMINAL_STATUSES.includes(status || "");
 }
 
 function renderProgressTracks(run) {

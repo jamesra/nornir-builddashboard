@@ -394,11 +394,11 @@ class DashboardStore:
                 WHERE COALESCE(TRIM(pipeline), '') != ''
                 ORDER BY
                   CASE
-                    WHEN COALESCE(status, 'running') IN ('completed', 'failed', 'skipped', 'stale')
+                    WHEN COALESCE(status, 'running') IN ('completed', 'failed', 'skipped', 'stopped', 'stale')
                     THEN 1 ELSE 0
                   END ASC,
                   CASE
-                    WHEN COALESCE(status, 'running') IN ('completed', 'failed', 'skipped', 'stale')
+                    WHEN COALESCE(status, 'running') IN ('completed', 'failed', 'skipped', 'stopped', 'stale')
                     THEN 0
                     ELSE COALESCE(last_seen, first_seen, 0)
                   END DESC,

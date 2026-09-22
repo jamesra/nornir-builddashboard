@@ -94,6 +94,7 @@ body {
 .badge.completed { background: rgba(63,185,80,0.15); color: var(--ok); }
 .badge.failed { background: rgba(248,81,73,0.15); color: var(--err); }
 .badge.skipped { background: rgba(210,153,34,0.15); color: var(--warn); }
+.badge.stopped { background: rgba(210,153,34,0.15); color: var(--warn); }
 .badge.stale { background: rgba(138,151,168,0.2); color: var(--muted); }
 
 .detail { flex: 1; display: flex; flex-direction: column; min-width: 0; }
