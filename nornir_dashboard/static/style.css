@@ -158,6 +158,25 @@ button.count-filter:focus-visible {
 }
 
 .progress-tracks { display: flex; flex-direction: column; gap: 8px; }
+
+.context-strip {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 8px 22px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+}
+.context-chip { display: flex; flex-direction: column; min-width: 0; max-width: 100%; }
+.context-chip label {
+    font-size: 10px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.05em;
+}
+.context-chip span,
+.context-chip-solo {
+    font-size: 13px; font-family: ui-monospace, monospace; word-break: break-word;
+}
 .progress-track {
     background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;
 }

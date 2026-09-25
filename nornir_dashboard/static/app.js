@@ -174,17 +174,38 @@ function formatTrackStatusLabel(track, fraction) {
   return "-";
 }
 
-/** Labeled name-only track (no bar): group title + current element/section. */
-function namedProgressTrackHtml(track) {
+/** Name-only track (no bar): label over value, packed into a shared context row. */
+function contextChipHtml(track) {
   const groupLabel = (track && track.label) || "progress";
   const item = trackItemName(track);
   if (item) {
     return (
-      `<div class="progress-track-label">${escapeHtml(groupLabel)}</div>` +
-      `<div class="progress-track-item">${escapeHtml(item)}</div>`
+      `<div class="context-chip">` +
+      `<label>${escapeHtml(groupLabel)}</label>` +
+      `<span>${escapeHtml(item)}</span></div>`
     );
   }
-  return `<div class="progress-track-label progress-track-single">${escapeHtml(groupLabel)}</div>`;
+  return (
+    `<div class="context-chip">` +
+    `<span class="context-chip-solo">${escapeHtml(groupLabel)}</span></div>`
+  );
+}
+
+function progressBarTrackHtml(title, pct, label) {
+  return (
+    `<div class="progress-track-label">${escapeHtml(title)}</div>` +
+    `<div class="progress-wrap">` +
+    `<div class="progress-bar"><div class="progress-fill" style="width:${pct.toFixed(1)}%"></div></div>` +
+    `<span class="progress-label">${escapeHtml(label)}</span></div>`
+  );
+}
+
+function appendContextStrip(container, tracks) {
+  if (!tracks.length) return;
+  const strip = document.createElement("div");
+  strip.className = "context-strip";
+  strip.innerHTML = tracks.map(contextChipHtml).join("");
+  container.appendChild(strip);
 }
 
 function sidebarProgressDisplay(run) {
@@ -454,12 +475,9 @@ function renderProgressTracks(run) {
     return;
   }
 
-  const tracks = progressTracksList(run);
-
-  if (!tracks.length) {
-    // Fallback single bar from top-level progress fields.
+  let sorted = progressTracksList(run);
+  if (!sorted.length) {
     const fraction = computeProgressFraction(run);
-    const pct = progressFractionToPercent(fraction);
     const fallbackTrack = {
       label: "Progress",
       total: run.progress_total,
@@ -471,24 +489,17 @@ function renderProgressTracks(run) {
     if (run.progress_total === 1) {
       fallbackTrack.label = run.current_element || run.current_section || "1 item";
     }
-    const label = formatTrackStatusLabel(fallbackTrack, fraction);
-    const track = document.createElement("div");
-    track.className = "progress-track";
-    if (trackHidesProgressBar(fallbackTrack)) {
-      track.innerHTML = namedProgressTrackHtml(fallbackTrack);
-    } else {
-      track.innerHTML =
-        `<div class="progress-track-label">Progress</div>` +
-        `<div class="progress-wrap">` +
-        `<div class="progress-bar"><div class="progress-fill" style="width:${pct.toFixed(1)}%"></div></div>` +
-        `<span class="progress-label">${escapeHtml(label)}</span></div>`;
-    }
-    container.appendChild(track);
-    return;
+    sorted = [fallbackTrack];
+  } else {
+    sorted = sorted.slice().sort((a, b) => (a.depth || 0) - (b.depth || 0));
   }
 
-  const sorted = tracks.slice().sort((a, b) => (a.depth || 0) - (b.depth || 0));
+  const staticTracks = [];
   for (const track of sorted) {
+    if (trackHidesProgressBar(track)) {
+      staticTracks.push(track);
+      continue;
+    }
     let fraction = track.fraction;
     if ((fraction === null || fraction === undefined) && track.total) {
       fraction = (track.current || 0) / track.total;
@@ -497,20 +508,12 @@ function renderProgressTracks(run) {
     const totalHint = track.total != null ? ` (${track.total} total)` : "";
     const title = `${track.label || "progress"}${totalHint}`;
     const label = formatTrackStatusLabel(track, fraction);
-
     const row = document.createElement("div");
     row.className = "progress-track";
-    if (trackHidesProgressBar(track)) {
-      row.innerHTML = namedProgressTrackHtml(track);
-    } else {
-      row.innerHTML =
-        `<div class="progress-track-label">${escapeHtml(title)}</div>` +
-        `<div class="progress-wrap">` +
-        `<div class="progress-bar"><div class="progress-fill" style="width:${pct.toFixed(1)}%"></div></div>` +
-        `<span class="progress-label">${escapeHtml(label)}</span></div>`;
-    }
+    row.innerHTML = progressBarTrackHtml(title, pct, label);
     container.appendChild(row);
   }
+  appendContextStrip(container, staticTracks);
 }
 
 function poolTracksList(run) {
