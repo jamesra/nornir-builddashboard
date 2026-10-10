@@ -53,6 +53,18 @@ def _coerce_number(value: Any, default: float) -> float:
     return result
 
 
+def _progress_fraction(numerator: Any, total: Any) -> float | None:
+    """Return ``numerator / total`` as a float, or None when it cannot be computed.
+
+    None covers a missing or zero *total* (None raises TypeError, zero raises
+    ZeroDivisionError) and publisher values that are not numeric.
+    """
+    try:
+        return float(numerator) / float(total)
+    except (TypeError, ZeroDivisionError, ValueError):
+        return None
+
+
 def _coerce_depth(value: Any) -> int | float:
     """Normalize a publisher-supplied track depth to a number (default 0)."""
     depth = _coerce_number(value, 0.0)
@@ -537,11 +549,8 @@ class MqttSubscriber:
         depth = _coerce_depth(payload.get("depth"))
 
         fraction = payload.get("fraction")
-        if fraction is None and current is not None and total:
-            try:
-                fraction = float(current) / float(total)
-            except (TypeError, ZeroDivisionError, ValueError):
-                fraction = None
+        if fraction is None:
+            fraction = _progress_fraction(current, total)
 
         tracks = dict(self._store.get_progress_tracks(run_id))
         existing = tracks.get(str(track_id))
@@ -603,11 +612,10 @@ class MqttSubscriber:
             fields["progress_total"] = best.get("total")
         if best.get("fraction") is not None:
             fields["progress_fraction"] = best.get("fraction")
-        elif best.get("total"):
-            try:
-                fields["progress_fraction"] = float(best.get("current") or 0) / float(best["total"])
-            except (TypeError, ZeroDivisionError, ValueError):
-                pass
+        else:
+            fallback = _progress_fraction(best.get("current") or 0, best.get("total"))
+            if fallback is not None:
+                fields["progress_fraction"] = fallback
         if fields:
             self._store.update_run_fields(run_id, fields)
 
@@ -632,11 +640,8 @@ class MqttSubscriber:
             fields["progress_total"] = payload.get("total")
 
         fraction = payload.get("fraction")
-        if fraction is None and payload.get("total"):
-            try:
-                fraction = float(payload.get("progress")) / float(payload.get("total"))
-            except (TypeError, ZeroDivisionError, ValueError):
-                fraction = None
+        if fraction is None:
+            fraction = _progress_fraction(payload.get("progress"), payload.get("total"))
         if fraction is not None:
             fields["progress_fraction"] = fraction
 
