@@ -65,6 +65,22 @@ def _is_chain_progress_track(track_id: str) -> bool:
     return tid == "chain" or tid.startswith("pipeline:")
 
 
+def _location_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the ``current_*`` run columns carried by an event payload.
+
+    ``section`` is stringified (publishers send ints); a key that is absent or
+    ``None`` is omitted so the stored value is left alone.
+    """
+    fields: dict[str, Any] = {}
+    if payload.get("element") is not None:
+        fields["current_element"] = payload.get("element")
+    if payload.get("section") is not None:
+        fields["current_section"] = str(payload.get("section"))
+    if payload.get("path") is not None:
+        fields["current_path"] = payload.get("path")
+    return fields
+
+
 def _should_persist_event(kind: str, payload: dict[str, Any]) -> bool:
     """Return False for high-churn kinds that must not displace log rows."""
     if kind in _EPHEMERAL_EVENT_KINDS:
@@ -444,12 +460,7 @@ class MqttSubscriber:
                     # keep --then chain / pipeline:* bars.
                     self._clear_in_pipeline_progress(run_id)
             fields["current_stage"] = new_stage
-            if payload.get("element") is not None:
-                fields["current_element"] = payload.get("element")
-            if payload.get("section") is not None:
-                fields["current_section"] = str(payload.get("section"))
-            if payload.get("path") is not None:
-                fields["current_path"] = payload.get("path")
+            fields.update(_location_fields(payload))
             if event_type == "stage_failed":
                 # PipelineManager raises PipelineError right after publishing
                 # this, so the run really is over; without a status write the
@@ -462,12 +473,7 @@ class MqttSubscriber:
                     fields["end_ts"] = payload.get("end_ts")
 
         if event_type == "iterate_progress":
-            if payload.get("section") is not None:
-                fields["current_section"] = str(payload.get("section"))
-            if payload.get("element") is not None:
-                fields["current_element"] = payload.get("element")
-            if payload.get("path") is not None:
-                fields["current_path"] = payload.get("path")
+            fields.update(_location_fields(payload))
             merged = self._merge_progress_track(run_id, payload)
             # Refresh top-level progress from shallowest largest track after merge.
             self._refresh_top_level_progress(run_id, tracks=merged)

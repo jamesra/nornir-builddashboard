@@ -3,7 +3,7 @@ import json
 import unittest
 from unittest.mock import MagicMock
 
-from nornir_dashboard.mqtt_subscriber import MqttSubscriber
+from nornir_dashboard.mqtt_subscriber import MqttSubscriber, _location_fields
 from nornir_dashboard.store import DashboardStore
 
 
@@ -612,6 +612,37 @@ class TestListRunsHidesUnnamed(unittest.TestCase):
         self.assertEqual(stale_ids, ["named"])
         self.assertEqual(deleted_ids, [])
         self.assertEqual(self.store.get_run("named")["status"], "stale")
+
+
+class TestLocationFields(unittest.TestCase):
+    def test_all_keys_present(self) -> None:
+        self.assertEqual(
+            _location_fields({"element": "TEM", "section": 63, "path": "/a/b"}),
+            {"current_element": "TEM", "current_section": "63", "current_path": "/a/b"},
+        )
+
+    def test_section_is_stringified(self) -> None:
+        self.assertEqual(_location_fields({"section": 7}), {"current_section": "7"})
+
+    def test_zero_section_is_kept(self) -> None:
+        self.assertEqual(_location_fields({"section": 0}), {"current_section": "0"})
+
+    def test_absent_and_none_keys_are_omitted(self) -> None:
+        self.assertEqual(_location_fields({}), {})
+        self.assertEqual(
+            _location_fields({"element": None, "section": None, "path": None}), {})
+
+    def test_element_and_path_are_not_stringified(self) -> None:
+        self.assertEqual(
+            _location_fields({"element": 5, "path": 9}),
+            {"current_element": 5, "current_path": 9},
+        )
+
+    def test_falsy_values_are_kept(self) -> None:
+        self.assertEqual(
+            _location_fields({"element": 0, "path": ""}),
+            {"current_element": 0, "current_path": ""},
+        )
 
 
 class TestStaleConfigAlwaysOn(unittest.TestCase):
