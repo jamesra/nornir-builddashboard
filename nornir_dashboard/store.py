@@ -432,21 +432,19 @@ class DashboardStore:
         status = row["status"]
         return None if status is None else str(status)
 
+    def _get_track_map(self, run_id: str, column: str) -> dict[str, Any]:
+        """Return a run's decoded ``column`` blob as a dict (empty when unset or unknown)."""
+        run = self.get_run(run_id)
+        tracks = run.get(column) if run is not None else None
+        return tracks if isinstance(tracks, dict) else {}
+
     def get_progress_tracks(self, run_id: str) -> dict[str, Any]:
         """Return the progress_tracks map for a run (empty dict when unset)."""
-        run = self.get_run(run_id)
-        if run is None:
-            return {}
-        tracks = run.get("progress_tracks") or {}
-        return tracks if isinstance(tracks, dict) else {}
+        return self._get_track_map(run_id, "progress_tracks")
 
     def get_pool_tracks(self, run_id: str) -> dict[str, Any]:
         """Return the pool_tracks map for a run (empty dict when unset)."""
-        run = self.get_run(run_id)
-        if run is None:
-            return {}
-        tracks = run.get("pool_tracks") or {}
-        return tracks if isinstance(tracks, dict) else {}
+        return self._get_track_map(run_id, "pool_tracks")
 
     def clear_run_progress(self, run_id: str) -> None:
         """Clear nested progress/pool tracks and top-level progress columns for a run."""

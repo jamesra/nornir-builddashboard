@@ -266,5 +266,28 @@ class TestEventSearchStaysRunScoped(StoreTestCase):
         self.assertEqual(len(found), 1)
 
 
+class TestTrackAccessors(StoreTestCase):
+    """get_progress_tracks / get_pool_tracks return their own map, {} when unset or unknown."""
+
+    def test_each_accessor_returns_only_its_own_map(self) -> None:
+        self.store.ensure_run("R1")
+        self.store.update_run_fields("R1", {"progress_tracks": {"a": 1}, "pool_tracks": {"b": 2}})
+        self.assertEqual(self.store.get_progress_tracks("R1"), {"a": 1})
+        self.assertEqual(self.store.get_pool_tracks("R1"), {"b": 2})
+
+    def test_unset_and_unknown_runs_give_empty_dict(self) -> None:
+        self.store.ensure_run("R1")
+        self.assertEqual(self.store.get_progress_tracks("R1"), {})
+        self.assertEqual(self.store.get_pool_tracks("R1"), {})
+        self.assertEqual(self.store.get_progress_tracks("nope"), {})
+        self.assertEqual(self.store.get_pool_tracks("nope"), {})
+
+    def test_non_dict_blob_gives_empty_dict(self) -> None:
+        self.store.ensure_run("R1")
+        self.store.update_run_fields("R1", {"progress_tracks": [1, 2], "pool_tracks": [3]})
+        self.assertEqual(self.store.get_progress_tracks("R1"), {})
+        self.assertEqual(self.store.get_pool_tracks("R1"), {})
+
+
 if __name__ == "__main__":
     unittest.main()
