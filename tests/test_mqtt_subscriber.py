@@ -557,6 +557,26 @@ class TestListRunsHidesUnnamed(unittest.TestCase):
         self.assertEqual(ids, ["named"])
         self.assertIsNotNone(self.store.get_run("stub"))
 
+    def test_list_runs_orders_active_before_every_terminal_status(self) -> None:
+        """Active runs sort first (newest activity first); each terminal status sorts after."""
+        terminal = ("completed", "failed", "skipped", "stopped", "stale")
+        for i, status in enumerate(terminal):
+            run_id = f"t-{status}"
+            self.store.ensure_run(run_id)
+            self.store.update_run_fields(run_id, {
+                "pipeline": "P", "status": status, "last_seen": 9000.0, "start_ts": 100.0 + i})
+        for run_id, status, seen in (("a-old", "running", 10.0), ("a-new", "running", 20.0),
+                                     ("a-none", None, 15.0)):
+            self.store.ensure_run(run_id)
+            fields: dict = {"pipeline": "P", "last_seen": seen, "start_ts": seen}
+            if status is not None:
+                fields["status"] = status
+            self.store.update_run_fields(run_id, fields)
+        ids = [r["run_id"] for r in self.store.list_runs()]
+        self.assertEqual(ids[:3], ["a-new", "a-none", "a-old"])
+        # Terminal runs tie on the second key, so start_ts DESC decides.
+        self.assertEqual(ids[3:], [f"t-{s}" for s in reversed(terminal)])
+
     def test_mark_stale_deletes_unnamed_and_clears_named_progress(self) -> None:
         now = 1_000_000.0
         self.store.ensure_run("stub", now=now - 1000)

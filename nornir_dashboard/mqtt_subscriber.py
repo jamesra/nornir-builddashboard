@@ -13,7 +13,7 @@ from typing import Any, Callable
 import paho.mqtt.client as mqtt
 import paho.mqtt.enums as mqtt_enum
 
-from nornir_dashboard.store import CLEAR, DashboardStore
+from nornir_dashboard.store import CLEAR, TERMINAL_STATUSES, DashboardStore
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +24,6 @@ _RETAINED_CLEAR_QOS = 1
 # Only the ``meta`` leaf is published with retain=True by
 # nornir_shared.mqtt_telemetry, so it is the only leaf a clear has to target.
 _RETAINED_LEAVES = ("meta",)
-
-_TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped", "stopped", "stale"})
 
 # High-churn telemetry: project into run summary + live WS, but do not append to
 # the SQLite transcript. Otherwise iterate_progress floods prune away real errors.
@@ -276,7 +274,7 @@ class MqttSubscriber:
             # Live traffic can revive a stale row unless this payload asserts a
             # terminal status (completed / failed / skipped / stopped / stale).
             incoming_status = payload.get("status")
-            if incoming_status not in _TERMINAL_STATUSES:
+            if incoming_status not in TERMINAL_STATUSES:
                 if self._store.get_run_status(run_id) == "stale":
                     self._store.update_run_fields(
                         run_id, {"status": "running", "end_ts": CLEAR})
@@ -386,7 +384,7 @@ class MqttSubscriber:
                 existing_pipeline = existing_pipeline.strip() or None
 
         status = payload.get("status")
-        if status in _TERMINAL_STATUSES:
+        if status in TERMINAL_STATUSES:
             self._store.clear_run_progress(run_id)
         elif (incoming_pipeline is not None
               and existing_pipeline is not None

@@ -45,6 +45,14 @@ class _ClearSentinel:
 # to say "write NULL" (for example clearing end_ts when a stale run revives).
 CLEAR = _ClearSentinel()
 
+# Run statuses that end a run. The sidebar ordering in ``list_runs`` and the
+# subscriber's stale-revival check both read this one set; static/app.js keeps
+# its own copy because it is a separate (JavaScript) runtime.
+TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped", "stopped", "stale"})
+
+# Constants only (never user input), so inlining them as SQL literals is safe.
+_TERMINAL_STATUS_SQL_LIST = ", ".join(f"'{s}'" for s in sorted(TERMINAL_STATUSES))
+
 
 _RUN_COLUMNS = (
     "run_id", "pipeline", "volumepath", "host", "pid", "session_id",
@@ -389,16 +397,16 @@ class DashboardStore:
         """
         with self._lock:
             rows = self._connection.execute(
-                """
+                f"""
                 SELECT * FROM runs
                 WHERE COALESCE(TRIM(pipeline), '') != ''
                 ORDER BY
                   CASE
-                    WHEN COALESCE(status, 'running') IN ('completed', 'failed', 'skipped', 'stopped', 'stale')
+                    WHEN COALESCE(status, 'running') IN ({_TERMINAL_STATUS_SQL_LIST})
                     THEN 1 ELSE 0
                   END ASC,
                   CASE
-                    WHEN COALESCE(status, 'running') IN ('completed', 'failed', 'skipped', 'stopped', 'stale')
+                    WHEN COALESCE(status, 'running') IN ({_TERMINAL_STATUS_SQL_LIST})
                     THEN 0
                     ELSE COALESCE(last_seen, first_seen, 0)
                   END DESC,
